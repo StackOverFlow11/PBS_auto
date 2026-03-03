@@ -1,2 +1,0 @@
-[console_scripts]
-pbs-auto = pbs_auto.cli:cli
