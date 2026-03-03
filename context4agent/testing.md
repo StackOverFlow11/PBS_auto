@@ -36,6 +36,9 @@
   - 默认配置完整性
   - 自定义值覆盖
   - 服务器配置不存在时报错
+- **TestQueueConfigParsing**: 队列配置解析
+  - 默认配置包含队列 / server1 队列值验证 / server2 队列验证
+  - 无队列配置时默认空字典
 - **TestLoadConfig**: 验证配置加载优先级
   - 显式路径加载
   - 不存在文件报错
@@ -53,6 +56,10 @@
   - 带空格格式
   - 无资源行 → None
   - 文件不存在 → None
+- **TestParseScriptResources**: 完整脚本资源解析
+  - 含 queue + walltime → 全部字段
+  - 无 queue / 无 walltime / 无资源行 / 文件不存在
+  - walltime 含分秒的精确解析
 - **TestScanDirectory**: 目录扫描
   - 基本扫描 + 排序验证
   - 核数正确解析
@@ -61,6 +68,7 @@
   - 不存在目录 → FileNotFoundError
   - 空目录 → 空列表
   - 自定义脚本名
+  - 扫描填充 queue 和 nodes 字段
   - 忽略根目录文件
 
 ### 3. PBS 解析测试 (test_pbs.py)
@@ -136,6 +144,9 @@ class FakePBSClient:
   - SUBMITTED 重置为 PENDING
   - COMPLETED 保持不变
   - RUNNING 保持不变（含 job_id）
+- **TestBackwardCompat**: 向后兼容性
+  - 旧 JSON 缺少 queue/nodes 字段仍可加载
+  - reconcile 同步新字段 (queue/nodes)
 - **TestListBatches**: 批次列表
   - 空目录
   - 有批次时返回摘要

@@ -20,8 +20,6 @@
 | name | str | (必填) | 任务名，即子目录名，也是 `qsub -N` 的值 |
 | directory | str | (必填) | 任务目录绝对路径 |
 | cores | int | 0 | 计算核数 (nodes * ppn) |
-| nodes | int | 0 | 原始节点数 |
-| queue | str \| None | None | 目标队列名 |
 | status | TaskStatus | PENDING | 当前状态 |
 | job_id | str \| None | None | PBS Job ID (如 "371824.mgr") |
 | submit_time | str \| None | None | 提交时间 ISO 格式 |
@@ -29,6 +27,8 @@
 | end_time | str \| None | None | 结束时间 |
 | error_message | str \| None | None | 错误/警告信息 |
 | script_name | str | "script.sh" | PBS 脚本文件名 |
+| queue | str \| None | None | 目标队列名（来自 #PBS -q / 自动选择 / CLI --queue） |
+| nodes | int | 0 | 原始节点数（用于队列合规验证） |
 
 提供 `to_dict()` / `from_dict()` 用于 JSON 序列化。
 
@@ -303,9 +303,9 @@ while not shutdown:
 │                                                       │
 │ Total: 10 | Pending: 3 | Running: 2 | Completed: 5  │
 │                                                       │
-│ Name     Cores  Status    Job ID      Elapsed         │
-│ task_1      48  running   371824      1h23m45s        │
-│ task_2      48  queued    371825      5m30s           │
+│ Name     Cores  Queue   Status    Job ID    Elapsed   │
+│ task_1      48  long    running   371824    1h23m45s  │
+│ task_2      48  medium  queued    371825    5m30s     │
 │                                                       │
 │ Elapsed: 02:15:30 | Last update: 14:23:45            │
 ╰──────────────────────────────────────────────────────╯
@@ -342,13 +342,15 @@ while not shutdown:
 ### submit 命令流程
 
 1. `load_config()` → 加载配置
-2. `scan_directory()` → 扫描任务
-3. `generate_batch_id()` + `load_state()` → 加载/创建状态
-4. `reconcile_tasks()` → 合并新旧状态（恢复场景）
-5. 如果 `--dry-run` → `run_dry_run()` 后返回
-6. 创建 `PBSClient` + `Display` + `Scheduler`
-7. `scheduler.run()` → 进入主循环
-8. `_print_summary()` → 输出最终摘要
+2. `scan_directory()` → 扫描任务（填充 queue/nodes）
+3. `validate_and_assign_queues()` → 队列验证与分配（除非 `--no-queue-validation`）
+   - 不合规任务：显示警告 → `click.confirm()` → 用户选跳过则标记 SKIPPED
+4. `generate_batch_id()` + `load_state()` → 加载/创建状态
+5. `reconcile_tasks()` → 合并新旧状态（恢复场景）
+6. 如果 `--dry-run` → `run_dry_run()` 后返回
+7. 创建 `PBSClient` + `Display` + `Scheduler`
+8. `scheduler.run()` → 进入主循环
+9. `_print_summary()` → 输出最终摘要
 
 ### 延迟导入
 

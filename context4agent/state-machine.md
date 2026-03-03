@@ -62,6 +62,7 @@ scan_directory()                │  ┌────────────┐ 
 | PENDING → SUBMITTED | `qsub` 返回 job_id | `scheduler.py:_submit_task()` |
 | PENDING → FAILED | `qsub` 抛异常 | `scheduler.py:_submit_task()` |
 | PENDING → SKIPPED | 扫描时发现问题 | `scanner.py:scan_directory()` |
+| PENDING → SKIPPED | 队列合规检查失败且用户选择跳过 | `cli.py:submit()` |
 | SUBMITTED → RUNNING | qstat 显示 state="R" | `scheduler.py:_poll_status()` |
 | SUBMITTED → QUEUED | qstat 显示 state="Q" | `scheduler.py:_poll_status()` |
 | SUBMITTED → WARNING | 作业从 PBS 中消失 | `scheduler.py:_handle_job_disappeared()` |
