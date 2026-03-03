@@ -7,17 +7,62 @@ post_submit_check_delay = 60 # Delay before first status check after submit (sec
 early_exit_threshold = 30    # Jobs ending within this time are flagged as warning (seconds)
 
 [servers.server1]
-name = "Server 1"
+name = "Chemistry Department"
 status_command = "qstat"
 status_args = ["-au", "$USER"]
-max_running_cores = 240
+max_running_cores = 192
 max_queued_cores = 192
 core_granularity = 24
 
+# Queue definitions for server1
+# Each queue specifies resource constraints that tasks must satisfy.
+# - max_cores / min_cores: core count range
+# - allowed_cores: if set, cores must be exactly one of these values
+# - max_nodes: max parallel nodes (-1 = unlimited)
+# - max_walltime_hours: maximum walltime in hours
+
+[servers.server1.queues.debug]
+max_cores = 24
+max_nodes = 1
+max_walltime_hours = 0.5
+
+[servers.server1.queues.short]
+max_cores = 48
+max_nodes = 1
+max_walltime_hours = 168
+
+[servers.server1.queues.medium]
+max_cores = 96
+min_cores = 24
+allowed_cores = [24, 48, 72, 96]
+max_nodes = 1
+max_walltime_hours = 240
+
+[servers.server1.queues.long]
+max_cores = 192
+min_cores = 48
+allowed_cores = [48, 96, 144, 192]
+max_nodes = -1
+max_walltime_hours = 360
+
 [servers.server2]
-name = "Server 2"
+name = "Group Server"
 status_command = "qstat"
 status_args = ["-au", "$USER"]
-max_running_cores = 480
-max_queued_cores = 384
+max_running_cores = 240
+max_queued_cores = 96
 core_granularity = 24
+
+[servers.server2.queues.medium]
+max_cores = 96
+min_cores = 24
+allowed_cores = [24, 48, 96]
+max_nodes = 1
+max_walltime_hours = 360
+
+[servers.server2.queues.long]
+max_cores = 192
+min_cores = 48
+allowed_cores = [48, 96, 192]
+max_nodes = -1
+max_walltime_hours = 360

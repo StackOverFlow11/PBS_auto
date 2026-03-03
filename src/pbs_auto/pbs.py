@@ -27,8 +27,13 @@ class PBSClient:
         if not script_path.exists():
             raise FileNotFoundError(f"Script not found: {script_path}")
 
+        cmd = ["qsub"]
+        if task.queue:
+            cmd.extend(["-q", task.queue])
+        cmd.extend(["-N", task.name, task.script_name])
+
         result = subprocess.run(
-            ["qsub", "-N", task.name, task.script_name],
+            cmd,
             cwd=task.directory,
             capture_output=True,
             text=True,

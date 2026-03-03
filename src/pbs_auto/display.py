@@ -165,6 +165,7 @@ class Display:
         table = Table(title="Active Tasks", expand=True, show_edge=False)
         table.add_column("Name", style="cyan", width=20)
         table.add_column("Cores", justify="right", width=6)
+        table.add_column("Queue", style="blue", width=10)
         table.add_column("Status", width=12)
         table.add_column("Job ID", width=15)
         table.add_column("Elapsed", width=12)
@@ -175,6 +176,7 @@ class Display:
             table.add_row(
                 task.name,
                 str(task.cores),
+                task.queue or "-",
                 Text(task.status.value, style=style),
                 task.job_id or "-",
                 elapsed,

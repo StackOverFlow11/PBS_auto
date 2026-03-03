@@ -77,9 +77,11 @@ def reconcile_tasks(
                 existing.job_id = None
                 existing.submit_time = None
             # For all other states, keep the saved state
-            # Update cores in case script changed
+            # Update fields in case script changed
             existing.cores = task.cores
             existing.directory = task.directory
+            existing.nodes = task.nodes
+            existing.queue = task.queue
         else:
             saved.tasks[task.name] = task
 

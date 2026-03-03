@@ -152,6 +152,58 @@ class TestReconcile:
         assert result.tasks["1"].job_id == "456"
 
 
+class TestBackwardCompat:
+    def test_load_old_json_without_queue_nodes(self, tmp_path, monkeypatch):
+        """Old state JSON files missing queue/nodes fields should load fine."""
+        monkeypatch.setattr("pbs_auto.state.DEFAULT_STATE_DIR", tmp_path)
+
+        old_data = {
+            "batch_id": "old_batch",
+            "root_directory": "/tmp/old",
+            "server_profile": "server1",
+            "created_at": "2025-01-01T00:00:00",
+            "updated_at": "2025-01-01T00:00:00",
+            "tasks": {
+                "t1": {
+                    "name": "t1",
+                    "directory": "/tmp/old/t1",
+                    "cores": 48,
+                    "status": "pending",
+                    "job_id": None,
+                    "submit_time": None,
+                    "start_time": None,
+                    "end_time": None,
+                    "error_message": None,
+                    "script_name": "script.sh",
+                }
+            },
+        }
+        import json
+        (tmp_path / "old_batch.json").write_text(json.dumps(old_data))
+
+        loaded = load_state("old_batch")
+        assert loaded is not None
+        task = loaded.tasks["t1"]
+        assert task.queue is None
+        assert task.nodes == 0
+        assert task.cores == 48
+
+    def test_reconcile_syncs_new_fields(self):
+        saved = BatchState(
+            batch_id="b1", root_directory="/tmp", server_profile="s1"
+        )
+        saved.tasks["1"] = Task(
+            name="1", directory="/tmp/1", cores=48,
+            status=TaskStatus.COMPLETED,
+        )
+        scanned = [
+            Task(name="1", directory="/tmp/1", cores=48, queue="medium", nodes=1),
+        ]
+        result = reconcile_tasks(saved, scanned)
+        assert result.tasks["1"].queue == "medium"
+        assert result.tasks["1"].nodes == 1
+
+
 class TestListBatches:
     def test_list_empty(self, tmp_path, monkeypatch):
         monkeypatch.setattr("pbs_auto.state.DEFAULT_STATE_DIR", tmp_path)

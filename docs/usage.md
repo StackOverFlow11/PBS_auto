@@ -109,6 +109,8 @@ pbs-auto submit ./workdir
 | `--dry-run` | 仅展示计划，不实际提交 |
 | `--fresh` | 丢弃旧状态，重新开始 |
 | `--script-name <name>` | 自定义 PBS 脚本文件名（默认 `script.sh`） |
+| `--queue <name>` | 强制所有任务使用指定队列（覆盖脚本 `#PBS -q` 和自动选择） |
+| `--no-queue-validation` | 跳过队列合规性检查 |
 
 ### `pbs-auto status <root_dir>`
 
@@ -121,6 +123,38 @@ pbs-auto submit ./workdir
 ### `pbs-auto list-batches`
 
 列出所有保存的批次状态记录。
+
+## 队列验证与自动选择
+
+工具会根据配置文件中的队列规则自动验证和选择队列：
+
+### 队列确定优先级
+
+1. `--queue` CLI 参数 → 强制所有任务使用指定队列
+2. 脚本中的 `#PBS -q` → 保留脚本指定的队列
+3. 自动选择 → 根据核心数和 walltime 选择最紧凑的合适队列
+
+### 合规性检查
+
+提交前工具会检查每个任务是否符合目标队列的规则（核心数、节点数）。如果发现不合规任务：
+- 显示警告表格（任务名、核心数、目标队列、不合规原因）
+- 询问是否继续提交
+- 选择"否"时，不合规任务被标记为 SKIPPED
+
+使用 `--no-queue-validation` 可跳过所有检查。
+
+### 使用示例
+
+```bash
+# 自动选择队列
+pbs-auto submit ./workdir --dry-run
+
+# 强制使用 long 队列
+pbs-auto submit ./workdir --queue long
+
+# 跳过队列检查
+pbs-auto submit ./workdir --no-queue-validation
+```
 
 ## 配置文件
 

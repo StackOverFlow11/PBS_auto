@@ -22,21 +22,71 @@ post_submit_check_delay = 60
 early_exit_threshold = 30
 
 [servers.server1]
-name = "Server 1"
+name = "Chemistry Department"
 status_command = "qstat"
 status_args = ["-au", "$USER"]
-max_running_cores = 240
+max_running_cores = 192
 max_queued_cores = 192
 core_granularity = 24
 
+[servers.server1.queues.debug]
+max_cores = 24
+max_nodes = 1
+max_walltime_hours = 0.5
+
+[servers.server1.queues.short]
+max_cores = 48
+max_nodes = 1
+max_walltime_hours = 168
+
+[servers.server1.queues.medium]
+max_cores = 96
+min_cores = 24
+allowed_cores = [24, 48, 72, 96]
+max_nodes = 1
+max_walltime_hours = 240
+
+[servers.server1.queues.long]
+max_cores = 192
+min_cores = 48
+allowed_cores = [48, 96, 144, 192]
+max_nodes = -1
+max_walltime_hours = 360
+
 [servers.server2]
-name = "Server 2"
+name = "Group Server"
 status_command = "qstat"
 status_args = ["-au", "$USER"]
-max_running_cores = 480
-max_queued_cores = 384
+max_running_cores = 240
+max_queued_cores = 96
 core_granularity = 24
+
+[servers.server2.queues.medium]
+max_cores = 96
+min_cores = 24
+allowed_cores = [24, 48, 96]
+max_nodes = 1
+max_walltime_hours = 360
+
+[servers.server2.queues.long]
+max_cores = 192
+min_cores = 48
+allowed_cores = [48, 96, 192]
+max_nodes = -1
+max_walltime_hours = 360
 """
+
+
+@dataclass
+class QueueConfig:
+    """Configuration for a single PBS queue."""
+
+    name: str
+    max_cores: int
+    min_cores: int = 0
+    allowed_cores: list[int] | None = None
+    max_nodes: int = 1
+    max_walltime_hours: float = 360.0
 
 
 @dataclass
@@ -49,6 +99,7 @@ class ServerConfig:
     max_running_cores: int = 240
     max_queued_cores: int = 192
     core_granularity: int = 24
+    queues: dict[str, QueueConfig] = field(default_factory=dict)
 
 
 @dataclass
@@ -122,6 +173,18 @@ def _parse_config(raw: dict) -> AppConfig:
 
     servers = {}
     for key, srv_data in servers_raw.items():
+        queues_raw = srv_data.get("queues", {})
+        queues = {}
+        for q_name, q_data in queues_raw.items():
+            queues[q_name] = QueueConfig(
+                name=q_name,
+                max_cores=q_data.get("max_cores", 0),
+                min_cores=q_data.get("min_cores", 0),
+                allowed_cores=q_data.get("allowed_cores"),
+                max_nodes=q_data.get("max_nodes", 1),
+                max_walltime_hours=q_data.get("max_walltime_hours", 360.0),
+            )
+
         servers[key] = ServerConfig(
             name=srv_data.get("name", key),
             status_command=srv_data.get("status_command", "qstat"),
@@ -129,6 +192,7 @@ def _parse_config(raw: dict) -> AppConfig:
             max_running_cores=srv_data.get("max_running_cores", 240),
             max_queued_cores=srv_data.get("max_queued_cores", 192),
             core_granularity=srv_data.get("core_granularity", 24),
+            queues=queues,
         )
 
     return AppConfig(

@@ -24,7 +24,9 @@ def cli():
 @click.option("--dry-run", is_flag=True, help="Show plan without submitting")
 @click.option("--fresh", is_flag=True, help="Discard saved state and start fresh")
 @click.option("--script-name", default=None, help="PBS script filename (default: script.sh)")
-def submit(root_dir, server, config_path, dry_run, fresh, script_name):
+@click.option("--queue", "cli_queue", default=None, help="Force all tasks to use this queue")
+@click.option("--no-queue-validation", is_flag=True, help="Skip queue compliance checks")
+def submit(root_dir, server, config_path, dry_run, fresh, script_name, cli_queue, no_queue_validation):
     """Scan directory and submit PBS tasks."""
     from pbs_auto.config import load_config
     from pbs_auto.display import Display
@@ -75,6 +77,52 @@ def submit(root_dir, server, config_path, dry_run, fresh, script_name):
         f"Found [green]{len(pending)}[/green] tasks, "
         f"[yellow]{len(skipped)}[/yellow] skipped"
     )
+
+    # Queue validation and assignment
+    if not no_queue_validation and server_config.queues:
+        from pbs_auto.queue import validate_and_assign_queues
+
+        tasks, invalid = validate_and_assign_queues(
+            tasks, server_config.queues, cli_queue=cli_queue
+        )
+
+        if invalid:
+            from rich.table import Table
+
+            console.print()
+            warn_table = Table(title="[yellow]Queue Compliance Warnings[/yellow]")
+            warn_table.add_column("Task", style="cyan")
+            warn_table.add_column("Cores", justify="right")
+            warn_table.add_column("Queue", style="blue")
+            warn_table.add_column("Issue", style="red")
+            for task, errors in invalid:
+                warn_table.add_row(
+                    task.name,
+                    str(task.cores),
+                    task.queue or "-",
+                    "; ".join(errors),
+                )
+            console.print(warn_table)
+            console.print()
+
+            if not click.confirm(
+                "Continue submitting non-compliant tasks?", default=False
+            ):
+                for task, _errors in invalid:
+                    task.status = TaskStatus.SKIPPED
+                    task.error_message = "Skipped: queue compliance check failed"
+                # Recount after skipping
+                pending = [t for t in tasks if t.status == TaskStatus.PENDING]
+                skipped = [t for t in tasks if t.status == TaskStatus.SKIPPED]
+                console.print(
+                    f"[yellow]Non-compliant tasks skipped. "
+                    f"{len(pending)} tasks remaining.[/yellow]"
+                )
+    elif cli_queue and not no_queue_validation:
+        # Set cli_queue even when no queue configs defined
+        for task in tasks:
+            if task.status == TaskStatus.PENDING:
+                task.queue = cli_queue
 
     # Load or create state
     batch_id = generate_batch_id(str(root))

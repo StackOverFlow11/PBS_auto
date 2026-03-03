@@ -3,7 +3,7 @@
 ## 概览
 
 - 测试框架: pytest >= 7.0
-- 测试数量: 55 个
+- 测试数量: 89 个
 - 运行命令: `python -m pytest tests/ -v`
 - 所有测试均不依赖真实 PBS 环境，可在任何机器上运行
 
@@ -11,17 +11,18 @@
 
 | 文件 | 用例数 | 覆盖模块 |
 |------|--------|----------|
-| test_config.py | 9 | config.py |
-| test_scanner.py | 8 | scanner.py |
+| test_config.py | 13 | config.py |
+| test_scanner.py | 15 | scanner.py |
 | test_pbs.py | 8 | pbs.py (解析函数) |
+| test_queue.py | 21 | queue.py |
 | test_scheduler.py | 10 | scheduler.py |
-| test_state.py | 10 | state.py |
+| test_state.py | 12 | state.py |
 
 ## 共享 Fixtures (conftest.py)
 
 | Fixture | 说明 |
 |---------|------|
-| `server_config` | 测试用 ServerConfig (240/192 cores) |
+| `server_config` | 测试用 ServerConfig (240/192 cores)，含 short/medium/long 队列 |
 | `app_config` | 包含 server_config 的 AppConfig |
 | `sample_tasks` | 3 个 PENDING 状态的 Task |
 | `sample_batch` | 包含 sample_tasks 的 BatchState |
@@ -78,7 +79,21 @@
 
 **关键测试数据**: `Q_OUTPUT` 常量来自 `requirements/successfully_submitted.md`，包含真实服务器输出格式。
 
-### 4. 调度器测试 (test_scheduler.py)
+### 4. 队列验证测试 (test_queue.py)
+
+- **TestValidateTaskForQueue**: 单任务合规性验证
+  - 范围型队列合规 / 列表型队列合规
+  - 核心数不在允许列表 / 低于最小值 / 超过最大值
+  - 节点数超限 / 无限制节点 / 多错误同时存在
+- **TestSelectQueue**: 自动选择队列
+  - 优先选最短 walltime / walltime 过滤
+  - 48/96/192 核心各场景
+  - 无匹配 / 空队列
+- **TestValidateAndAssignQueues**: 批量验证与分配
+  - CLI 队列覆盖脚本 / 脚本队列保留 / 自动选择
+  - 不合规任务标记 / SKIPPED 任务忽略 / 空队列
+
+### 5. 调度器测试 (test_scheduler.py)
 
 使用 `FakePBSClient` 和 `FakeDisplay` 替代真实依赖。
 
@@ -103,7 +118,7 @@ class FakePBSClient:
   - PBS 报告 R → task 变为 RUNNING + 记录 start_time
   - PBS 报告 Q → task 变为 QUEUED
 
-### 5. 持久化测试 (test_state.py)
+### 6. 持久化测试 (test_state.py)
 
 所有测试使用 `monkeypatch` 重定向 `DEFAULT_STATE_DIR` 到 `tmp_path`。
 

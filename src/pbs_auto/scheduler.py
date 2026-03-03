@@ -251,6 +251,7 @@ def run_dry_run(state: BatchState, server: ServerConfig) -> None:
     table.add_column("Name", style="cyan")
     table.add_column("Directory")
     table.add_column("Cores", justify="right", style="green")
+    table.add_column("Queue", style="blue")
     table.add_column("Status", style="yellow")
     table.add_column("Note", style="dim")
 
@@ -273,6 +274,7 @@ def run_dry_run(state: BatchState, server: ServerConfig) -> None:
             task.name,
             task.directory,
             str(task.cores),
+            task.queue or "-",
             f"[{status_style}]{task.status.value}[/{status_style}]",
             note,
         )

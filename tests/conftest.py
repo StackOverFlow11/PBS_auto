@@ -5,7 +5,7 @@ from __future__ import annotations
 import pytest
 from pathlib import Path
 
-from pbs_auto.config import AppConfig, ServerConfig
+from pbs_auto.config import AppConfig, QueueConfig, ServerConfig
 from pbs_auto.models import BatchState, Task, TaskStatus
 
 
@@ -16,6 +16,19 @@ def server_config():
         max_running_cores=240,
         max_queued_cores=192,
         core_granularity=24,
+        queues={
+            "short": QueueConfig(
+                name="short", max_cores=48, max_nodes=1, max_walltime_hours=168,
+            ),
+            "medium": QueueConfig(
+                name="medium", max_cores=96, min_cores=24,
+                allowed_cores=[24, 48, 72, 96], max_nodes=1, max_walltime_hours=240,
+            ),
+            "long": QueueConfig(
+                name="long", max_cores=192, min_cores=48,
+                allowed_cores=[48, 96, 144, 192], max_nodes=-1, max_walltime_hours=360,
+            ),
+        },
     )
 
 

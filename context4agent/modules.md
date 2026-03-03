@@ -20,6 +20,8 @@
 | name | str | (必填) | 任务名，即子目录名，也是 `qsub -N` 的值 |
 | directory | str | (必填) | 任务目录绝对路径 |
 | cores | int | 0 | 计算核数 (nodes * ppn) |
+| nodes | int | 0 | 原始节点数 |
+| queue | str \| None | None | 目标队列名 |
 | status | TaskStatus | PENDING | 当前状态 |
 | job_id | str \| None | None | PBS Job ID (如 "371824.mgr") |
 | submit_time | str \| None | None | 提交时间 ISO 格式 |
@@ -60,7 +62,7 @@
 
 **文件**: `src/pbs_auto/config.py`
 **依赖**: `tomli`
-**测试**: `tests/test_config.py` (9 个用例)
+**测试**: `tests/test_config.py` (13 个用例)
 
 ### 关键常量
 
@@ -70,7 +72,8 @@
 
 ### 数据类
 
-- `ServerConfig`: 单个服务器的资源限额和查询命令配置
+- `QueueConfig`: 单个 PBS 队列的资源规则（核心数范围/列表、节点限制、walltime 上限）
+- `ServerConfig`: 单个服务器的资源限额和查询命令配置，含 `queues: dict[str, QueueConfig]`
 - `AppConfig`: 全局配置，包含 defaults + servers 字典
 
 ### 关键函数
@@ -91,28 +94,54 @@
 
 **文件**: `src/pbs_auto/scanner.py`
 **依赖**: `models.py`
-**测试**: `tests/test_scanner.py` (8 个用例)
+**测试**: `tests/test_scanner.py` (15 个用例)
 
 ### 核心正则
 
 ```python
-PBS_RESOURCE_RE = re.compile(
-    r"^\s*#PBS\s+-l\s+nodes\s*=\s*(\d+)\s*:\s*ppn\s*=\s*(\d+)",
-    re.MULTILINE,
-)
+PBS_RESOURCE_RE   # 匹配 #PBS -l nodes=X:ppn=Y
+PBS_QUEUE_RE      # 匹配 #PBS -q <queue_name>
+PBS_WALLTIME_RE   # 匹配 #PBS -l walltime=HH:MM:SS
 ```
 
-匹配 `#PBS -l nodes=X:ppn=Y`，支持等号和冒号前后空格。
+### 数据类
+
+#### `ScriptResources(dataclass)`
+
+| 字段 | 类型 | 默认值 | 说明 |
+|------|------|--------|------|
+| nodes | int | 0 | 节点数 |
+| ppn | int | 0 | 每节点核数 |
+| cores | int | 0 | nodes * ppn |
+| queue | str \| None | None | #PBS -q 指定的队列名 |
+| walltime_seconds | int \| None | None | walltime 总秒数 |
 
 ### 关键函数
 
 - `natural_sort_key(name)`: 自然排序 key 函数 (1, 2, 10 而非 1, 10, 2)
-- `parse_cores_from_script(script_path)`: 解析 PBS 脚本中的 nodes*ppn，失败返回 None
-- `scan_directory(root, script_name)`: 扫描一级子目录，返回 Task 列表
+- `parse_script_resources(script_path)`: 解析 PBS 脚本中所有资源指令，返回 ScriptResources 或 None
+- `parse_cores_from_script(script_path)`: 向后兼容的薄包装器，返回 cores 或 None
+- `scan_directory(root, script_name)`: 扫描一级子目录，返回 Task 列表（填充 queue、nodes 字段）
   - 仅扫描直接子目录（不递归）
   - 缺少脚本 → SKIPPED + error_message
   - 无法解析资源 → SKIPPED + error_message
   - 结果按自然顺序排序
+
+---
+
+## queue.py — 队列验证与自动选择
+
+**文件**: `src/pbs_auto/queue.py`
+**依赖**: `config.py` (QueueConfig), `models.py` (Task, TaskStatus)
+**测试**: `tests/test_queue.py` (21 个用例)
+
+详见 [queue-validation.md](queue-validation.md)。
+
+### 关键函数
+
+- `validate_task_for_queue(task, queue_config)`: 验证单任务合规性，返回错误列表
+- `select_queue(task, queues, walltime_seconds)`: 自动选择最合适的队列
+- `validate_and_assign_queues(tasks, queues, cli_queue)`: 批量验证与分配
 
 ---
 
@@ -128,7 +157,7 @@ PBS_RESOURCE_RE = re.compile(
 PBSClient(server_config: ServerConfig)
 ```
 
-- `submit(task)`: 在 task.directory 下执行 `qsub -N <name> <script_name>`，返回 job_id
+- `submit(task)`: 在 task.directory 下执行 `qsub [-q <queue>] -N <name> <script_name>`，返回 job_id
 - `query_user_jobs(force=False)`: 查询用户作业，结果缓存 5 秒
 - `invalidate_cache()`: 清除缓存
 
@@ -170,7 +199,7 @@ Job ID          Username Queue    Jobname    SessID NDS TSK Memory Time  S Time
 
 **文件**: `src/pbs_auto/state.py`
 **依赖**: `config.py`, `models.py`
-**测试**: `tests/test_state.py` (10 个用例)
+**测试**: `tests/test_state.py` (12 个用例)
 
 ### 关键函数
 
@@ -183,7 +212,7 @@ Job ID          Username Queue    Jobname    SessID NDS TSK Memory Time  S Time
   - RUNNING/QUEUED: 保持不变（scheduler 会重新检查 PBS）
   - SUBMITTED: 重置为 PENDING（无法验证 qsub 是否真的成功）
   - 新任务: 添加为 PENDING
-  - 所有任务更新 cores 和 directory（脚本可能被编辑）
+  - 所有任务更新 cores、directory、nodes、queue（脚本可能被编辑）
 - `list_batches()`: 扫描状态目录，返回所有批次的摘要信息
 
 ---

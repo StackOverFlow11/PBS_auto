@@ -34,6 +34,8 @@ class Task:
     end_time: str | None = None
     error_message: str | None = None
     script_name: str = "script.sh"
+    queue: str | None = None
+    nodes: int = 0
 
     def to_dict(self) -> dict:
         return {
@@ -47,12 +49,16 @@ class Task:
             "end_time": self.end_time,
             "error_message": self.error_message,
             "script_name": self.script_name,
+            "queue": self.queue,
+            "nodes": self.nodes,
         }
 
     @classmethod
     def from_dict(cls, data: dict) -> Task:
         data = dict(data)
         data["status"] = TaskStatus(data["status"])
+        data.setdefault("queue", None)
+        data.setdefault("nodes", 0)
         return cls(**data)
 
 

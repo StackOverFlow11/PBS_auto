@@ -10,6 +10,7 @@ from pbs_auto.models import TaskStatus
 from pbs_auto.scanner import (
     natural_sort_key,
     parse_cores_from_script,
+    parse_script_resources,
     scan_directory,
 )
 
@@ -55,6 +56,61 @@ class TestParseCores:
     def test_missing_file(self, tmp_path):
         script = tmp_path / "nonexistent.sh"
         assert parse_cores_from_script(script) is None
+
+
+class TestParseScriptResources:
+    def test_full_parse(self, tmp_path):
+        script = tmp_path / "test.sh"
+        script.write_text(
+            "#!/bin/bash\n"
+            "#PBS -q medium\n"
+            "#PBS -l nodes=2:ppn=48\n"
+            "#PBS -l walltime=120:00:00\n"
+        )
+        res = parse_script_resources(script)
+        assert res is not None
+        assert res.nodes == 2
+        assert res.ppn == 48
+        assert res.cores == 96
+        assert res.queue == "medium"
+        assert res.walltime_seconds == 120 * 3600
+
+    def test_no_queue(self, tmp_path):
+        script = tmp_path / "test.sh"
+        script.write_text("#PBS -l nodes=1:ppn=24\n")
+        res = parse_script_resources(script)
+        assert res is not None
+        assert res.queue is None
+        assert res.cores == 24
+
+    def test_no_walltime(self, tmp_path):
+        script = tmp_path / "test.sh"
+        script.write_text(
+            "#PBS -q long\n"
+            "#PBS -l nodes=1:ppn=96\n"
+        )
+        res = parse_script_resources(script)
+        assert res is not None
+        assert res.walltime_seconds is None
+        assert res.queue == "long"
+
+    def test_no_resource_line(self, tmp_path):
+        script = tmp_path / "test.sh"
+        script.write_text("#!/bin/bash\necho hello\n")
+        assert parse_script_resources(script) is None
+
+    def test_missing_file(self, tmp_path):
+        script = tmp_path / "nonexistent.sh"
+        assert parse_script_resources(script) is None
+
+    def test_walltime_with_minutes_seconds(self, tmp_path):
+        script = tmp_path / "test.sh"
+        script.write_text(
+            "#PBS -l nodes=1:ppn=24\n"
+            "#PBS -l walltime=01:30:45\n"
+        )
+        res = parse_script_resources(script)
+        assert res.walltime_seconds == 1 * 3600 + 30 * 60 + 45
 
 
 class TestScanDirectory:
@@ -109,6 +165,13 @@ class TestScanDirectory:
         assert len(tasks) == 1
         assert tasks[0].cores == 24
         assert tasks[0].script_name == "vasp.sh"
+
+    def test_scan_populates_queue_and_nodes(self, workdir):
+        tasks = scan_directory(workdir)
+        # The workdir fixture scripts have #PBS -q medium
+        for t in tasks:
+            assert t.queue == "medium"
+            assert t.nodes == 1
 
     def test_scan_ignores_files_in_root(self, tmp_path):
         """Files (not dirs) in root should be ignored."""
