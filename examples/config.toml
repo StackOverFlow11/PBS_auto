@@ -1,0 +1,23 @@
+[defaults]
+server = "server1"
+script_name = "script.sh"
+poll_interval = 15           # Polling interval in seconds
+submit_delay = 2             # Delay between consecutive submissions (seconds)
+post_submit_check_delay = 60 # Delay before first status check after submit (seconds)
+early_exit_threshold = 30    # Jobs ending within this time are flagged as warning (seconds)
+
+[servers.server1]
+name = "Server 1"
+status_command = "qstat"
+status_args = ["-au", "$USER"]
+max_running_cores = 240
+max_queued_cores = 192
+core_granularity = 24
+
+[servers.server2]
+name = "Server 2"
+status_command = "qstat"
+status_args = ["-au", "$USER"]
+max_running_cores = 480
+max_queued_cores = 384
+core_granularity = 24
