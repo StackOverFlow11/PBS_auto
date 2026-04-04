@@ -163,6 +163,12 @@ PBSClient(server_config: ServerConfig)
 
 根据 `server_config.status_command` 选择 qstat 或 q 解析器。
 
+### 模块级函数
+
+#### `_is_retryable_error(error_msg)`
+
+判断 qsub 错误是否为临时性资源冲突，匹配 `RETRYABLE_PATTERNS` 列表中的关键字（不区分大小写）。匹配时任务保持 PENDING 下一轮重试，不匹配时标记为 FAILED。
+
 ### 解析函数
 
 #### `parse_qstat_output(output)`
@@ -271,6 +277,19 @@ while not shutdown:
 - 不满足则 `continue`（跳过，等下个周期）
 
 提交后调用 `invalidate_cache()` 因为队列状态已变化。
+
+当 `_submit_task()` 返回 `False`（可重试错误）时，`break` 停止本轮提交。
+
+#### 提交单任务 `_submit_task(task) -> bool`
+
+返回 `True` 表示成功或永久失败（继续下一个任务），`False` 表示可重试错误（停止本轮）。
+
+错误分类：
+- `FileNotFoundError` → FAILED（永久）
+- `RuntimeError`/`OSError` + 匹配 `_is_retryable_error()` → 保持 PENDING（可重试）
+- `RuntimeError`/`OSError` + 不匹配 → FAILED（永久）
+
+成功时清除之前可能存在的 `error_message`。
 
 #### SIGINT 处理
 

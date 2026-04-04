@@ -60,7 +60,8 @@ scan_directory()                │  ┌────────────┐ 
 | 转换 | 条件 | 代码位置 |
 |------|------|----------|
 | PENDING → SUBMITTED | `qsub` 返回 job_id | `scheduler.py:_submit_task()` |
-| PENDING → FAILED | `qsub` 抛异常 | `scheduler.py:_submit_task()` |
+| PENDING → FAILED | `qsub` 不可重试错误（脚本不存在、无效队列等） | `scheduler.py:_submit_task()` |
+| PENDING → PENDING | `qsub` 可重试错误（资源超限等），下一轮重试 | `scheduler.py:_submit_task()` |
 | PENDING → SKIPPED | 扫描时发现问题 | `scanner.py:scan_directory()` |
 | PENDING → SKIPPED | 队列合规检查失败且用户选择跳过 | `cli.py:submit()` |
 | SUBMITTED → RUNNING | qstat 显示 state="R" | `scheduler.py:_poll_status()` |
@@ -82,6 +83,19 @@ scan_directory()                │  ┌────────────┐ 
 | WARNING | WARNING | 已标记，不变 |
 | FAILED | FAILED | 已失败，不变 |
 | SKIPPED | SKIPPED | 仍然跳过 |
+
+## 可重试错误 (Retryable Errors)
+
+`_submit_task()` 通过 `_is_retryable_error()` 判断 qsub 错误是否为临时性资源冲突。匹配以下关键字（不区分大小写）的错误保持 `PENDING`，下一轮重试：
+
+- `would exceed` — PBS 资源限额超出（多实例并发提交时常见）
+- `resource busy` — PBS 资源繁忙
+- `try again` — 临时错误
+- `temporarily unavailable` — 临时不可用
+
+不匹配的错误（如无效队列、权限不足）标记为 `FAILED`。`FileNotFoundError`（脚本不存在）始终为永久错误。
+
+当可重试错误发生时，`_submit_pending()` 会 `break` 停止本轮提交（资源已满，继续提交无意义）。
 
 ## early_exit_threshold
 

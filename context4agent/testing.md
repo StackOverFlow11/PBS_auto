@@ -3,7 +3,7 @@
 ## 概览
 
 - 测试框架: pytest >= 7.0
-- 测试数量: 89 个
+- 测试数量: 122 个
 - 运行命令: `python -m pytest tests/ -v`
 - 所有测试均不依赖真实 PBS 环境，可在任何机器上运行
 
@@ -13,9 +13,9 @@
 |------|--------|----------|
 | test_config.py | 13 | config.py |
 | test_scanner.py | 15 | scanner.py |
-| test_pbs.py | 8 | pbs.py (解析函数) |
+| test_pbs.py | 36 | pbs.py (解析函数 + PBSClient) |
 | test_queue.py | 21 | queue.py |
-| test_scheduler.py | 10 | scheduler.py |
+| test_scheduler.py | 15 | scheduler.py |
 | test_state.py | 12 | state.py |
 
 ## 共享 Fixtures (conftest.py)
@@ -122,6 +122,12 @@ class FakePBSClient:
   - SUBMITTED 消失 → WARNING
   - 短时间运行 → WARNING + 包含秒数的 error_message
   - 长时间运行 → COMPLETED
+- **TestSubmitTaskRetry**: 可重试错误处理
+  - `would exceed` 错误 → 任务保持 PENDING + error_message 含 "Retryable"
+  - 非重试错误 → 任务变为 FAILED
+  - `FileNotFoundError` → 任务变为 FAILED（永久）
+  - 可重试错误 → 停止本轮提交（后续任务不再尝试）
+  - 重试成功 → 清除之前的 error_message
 - **TestPollStatus**: 轮询状态更新
   - PBS 报告 R → task 变为 RUNNING + 记录 start_time
   - PBS 报告 Q → task 变为 QUEUED
@@ -164,7 +170,6 @@ class FakePBSClient:
 
 - `display.py`: UI 渲染层，不做单元测试
 - `cli.py`: 入口层，通过集成测试覆盖 (CLI dry-run)
-- `PBSClient.submit()` / `query_user_jobs()`: 涉及 subprocess，仅测试解析函数
 
 ## 添加新测试的规范
 

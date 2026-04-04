@@ -14,6 +14,21 @@ from pbs_auto.pbs import PBSClient
 from pbs_auto.state import save_state
 
 
+# Retryable qsub error patterns (matched case-insensitively)
+RETRYABLE_PATTERNS = [
+    "would exceed",
+    "resource busy",
+    "try again",
+    "temporarily unavailable",
+]
+
+
+def _is_retryable_error(error_msg: str) -> bool:
+    """Check if a qsub error is transient and should be retried."""
+    lower = error_msg.lower()
+    return any(p in lower for p in RETRYABLE_PATTERNS)
+
+
 class Scheduler:
     """Manages the submission loop: poll → submit → persist → display."""
 
@@ -153,24 +168,43 @@ class Scheduler:
             if queued_cores + task.cores > self.server.max_queued_cores:
                 continue
 
-            self._submit_task(task)
+            if not self._submit_task(task):
+                # Transient error (e.g. resource limit) — stop this round
+                break
 
             # Delay between submissions
             if self.config.submit_delay > 0:
                 self._sleep(self.config.submit_delay)
 
-    def _submit_task(self, task: Task) -> None:
-        """Submit a single task via qsub."""
+    def _submit_task(self, task: Task) -> bool:
+        """Submit a single task via qsub.
+
+        Returns True if submission succeeded or failed permanently
+        (caller should continue to next task). Returns False if
+        the error is transient (caller should stop this round).
+        """
         try:
             job_id = self.pbs.submit(task)
             task.job_id = job_id
             task.status = TaskStatus.SUBMITTED
             task.submit_time = datetime.now().isoformat()
+            task.error_message = None
             # Invalidate cache since we changed the queue
             self.pbs.invalidate_cache()
-        except (RuntimeError, FileNotFoundError, OSError) as e:
+            return True
+        except FileNotFoundError as e:
             task.status = TaskStatus.FAILED
             task.error_message = str(e)
+            return True
+        except (RuntimeError, OSError) as e:
+            error_msg = str(e)
+            if _is_retryable_error(error_msg):
+                # Resource conflict — stay PENDING for next round
+                task.error_message = f"Retryable: {error_msg}"
+                return False
+            task.status = TaskStatus.FAILED
+            task.error_message = error_msg
+            return True
 
     def _get_resource_usage(self) -> tuple[int, int]:
         """Get current resource usage from PBS.

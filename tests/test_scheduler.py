@@ -140,6 +140,124 @@ class TestHandleJobDisappeared:
         assert task.status == TaskStatus.COMPLETED
 
 
+class TestSubmitTaskRetry:
+    """Tests for retryable vs permanent qsub error handling."""
+
+    def _make_scheduler(self, tasks, pbs_client=None):
+        server = ServerConfig(
+            name="Test",
+            max_running_cores=240,
+            max_queued_cores=192,
+        )
+        config = AppConfig(
+            server="test",
+            servers={"test": server},
+            submit_delay=0,
+            poll_interval=1,
+        )
+        state = BatchState(
+            batch_id="test",
+            root_directory="/tmp",
+            server_profile="test",
+        )
+        state.tasks = {t.name: t for t in tasks}
+        pbs = pbs_client or FakePBSClient()
+        display = FakeDisplay()
+        return Scheduler(state, config, server, pbs, display)
+
+    def test_retryable_error_stays_pending(self):
+        """qsub 'would exceed' keeps task PENDING for retry."""
+        pbs = FakePBSClient()
+        pbs.submit = MagicMock(
+            side_effect=RuntimeError(
+                "qsub failed: qsub: would exceed user shaofl's limit on resource ncpus in complex"
+            )
+        )
+        task = Task(name="t1", directory="/tmp/1", cores=24, status=TaskStatus.PENDING)
+        scheduler = self._make_scheduler([task], pbs)
+
+        result = scheduler._submit_task(task)
+
+        assert task.status == TaskStatus.PENDING
+        assert "Retryable" in task.error_message
+        assert result is False
+
+    def test_permanent_error_becomes_failed(self):
+        """qsub non-retryable error marks task as FAILED."""
+        pbs = FakePBSClient()
+        pbs.submit = MagicMock(
+            side_effect=RuntimeError("qsub failed: invalid queue specified")
+        )
+        task = Task(name="t1", directory="/tmp/1", cores=24, status=TaskStatus.PENDING)
+        scheduler = self._make_scheduler([task], pbs)
+
+        result = scheduler._submit_task(task)
+
+        assert task.status == TaskStatus.FAILED
+        assert "invalid queue" in task.error_message
+        assert result is True
+
+    def test_script_not_found_becomes_failed(self):
+        """FileNotFoundError is always a permanent failure."""
+        pbs = FakePBSClient()
+        pbs.submit = MagicMock(
+            side_effect=FileNotFoundError("Script not found: /tmp/1/script.sh")
+        )
+        task = Task(name="t1", directory="/tmp/1", cores=24, status=TaskStatus.PENDING)
+        scheduler = self._make_scheduler([task], pbs)
+
+        result = scheduler._submit_task(task)
+
+        assert task.status == TaskStatus.FAILED
+        assert "Script not found" in task.error_message
+        assert result is True
+
+    def test_retryable_error_stops_batch(self):
+        """Retryable error stops submitting remaining tasks in this round."""
+        pbs = FakePBSClient()
+        call_count = 0
+
+        def failing_submit(task):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 2:
+                raise RuntimeError("qsub failed: would exceed ncpus limit")
+            return pbs._real_submit(task)
+
+        pbs._real_submit = pbs.submit
+        pbs.submit = failing_submit
+
+        tasks = [
+            Task(name="t1", directory="/tmp/1", cores=24, status=TaskStatus.PENDING),
+            Task(name="t2", directory="/tmp/2", cores=24, status=TaskStatus.PENDING),
+            Task(name="t3", directory="/tmp/3", cores=24, status=TaskStatus.PENDING),
+        ]
+        scheduler = self._make_scheduler(tasks, pbs)
+        scheduler._submit_pending()
+
+        # t1 submitted, t2 retryable fail → break, t3 never attempted
+        assert tasks[0].status == TaskStatus.SUBMITTED
+        assert tasks[1].status == TaskStatus.PENDING
+        assert tasks[2].status == TaskStatus.PENDING
+        assert call_count == 2
+
+    def test_retryable_error_cleared_on_success(self):
+        """Successful retry clears the previous error_message."""
+        task = Task(
+            name="t1", directory="/tmp/1", cores=24,
+            status=TaskStatus.PENDING,
+            error_message="Retryable: qsub failed: would exceed ncpus",
+        )
+        pbs = FakePBSClient()
+        scheduler = self._make_scheduler([task], pbs)
+
+        result = scheduler._submit_task(task)
+
+        assert task.status == TaskStatus.SUBMITTED
+        assert task.error_message is None
+        assert result is True
+
+
 class TestPollStatus:
     def test_running_job_detected(self):
         pbs = FakePBSClient()
