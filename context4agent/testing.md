@@ -3,7 +3,7 @@
 ## 概览
 
 - 测试框架: pytest >= 7.0
-- 测试数量: 122 个
+- 测试数量: 177 个
 - 运行命令: `python -m pytest tests/ -v`
 - 所有测试均不依赖真实 PBS 环境，可在任何机器上运行
 
@@ -15,8 +15,16 @@
 | test_scanner.py | 15 | scanner.py |
 | test_pbs.py | 36 | pbs.py (解析函数 + PBSClient) |
 | test_queue.py | 21 | queue.py |
-| test_scheduler.py | 15 | scheduler.py |
-| test_state.py | 12 | state.py |
+| test_scheduler.py | 18 | scheduler.py (含 mutation context + index 维护) |
+| test_state.py | 38 | state.py (JSON/migration/reconcile/identifier) |
+| test_batch_store.py | 29 | batch_store/ (paths/sentinels/mutation/rotation) |
+
+## 测试文件边界（与源码对称）
+
+- **test_state.py**：`state.py` 的 JSON 序列化、migration、reconcile、identifier 解析、list_batches
+- **test_batch_store.py**：`batch_store/` 的路径、权限、哨兵 CRUD、mutation context、日志轮转
+- **test_scheduler.py**：scheduler 主循环逻辑、mutation context 使用、flag-only signals、index 维护
+- **test_daemon.py**（规划中）：PID 文件、/proc/stat 解析、lockf helper（不真正 fork）
 
 ## 共享 Fixtures (conftest.py)
 
@@ -25,8 +33,10 @@
 | `server_config` | 测试用 ServerConfig (240/192 cores)，含 short/medium/long 队列 |
 | `app_config` | 包含 server_config 的 AppConfig |
 | `sample_tasks` | 3 个 PENDING 状态的 Task |
-| `sample_batch` | 包含 sample_tasks 的 BatchState |
+| `sample_batch` | 包含 sample_tasks 的 BatchState，`root_directories=["/tmp/tasks"]` + `name="sample"`，tasks 按 directory 索引 |
 | `workdir` | tmp_path 下创建 5 个任务子目录 (含 script.sh)，核数交替 24/48 |
+
+`test_state.py` 和 `test_batch_store.py` 都用 module-level `_isolate_state_dir` autouse fixture 把 `DEFAULT_STATE_DIR` 重定向到 `tmp_path`，避免污染用户真实 state 目录。
 
 ## 测试策略
 
