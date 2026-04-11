@@ -67,6 +67,27 @@ class TestParseConfig:
         s = config.get_server("custom")
         assert s.max_running_cores == 480
 
+    def test_skip_if_exists_default_empty(self):
+        config = _parse_config({"defaults": {}, "servers": {}})
+        assert config.skip_if_exists == []
+
+    def test_skip_if_exists_list(self):
+        raw = {
+            "defaults": {"skip_if_exists": ["cal.out", "time", "*.done"]},
+            "servers": {},
+        }
+        config = _parse_config(raw)
+        assert config.skip_if_exists == ["cal.out", "time", "*.done"]
+
+    def test_skip_if_exists_string_wrapped_to_list(self):
+        """Single string values are wrapped into a one-element list."""
+        raw = {
+            "defaults": {"skip_if_exists": "cal.out"},
+            "servers": {},
+        }
+        config = _parse_config(raw)
+        assert config.skip_if_exists == ["cal.out"]
+
 
 class TestQueueConfigParsing:
     def test_default_config_has_queues(self):

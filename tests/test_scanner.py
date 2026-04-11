@@ -181,3 +181,80 @@ class TestScanDirectory:
         (task_dir / "script.sh").write_text("#PBS -l nodes=1:ppn=24\n")
         tasks = scan_directory(tmp_path)
         assert len(tasks) == 1
+
+
+class TestSkipIfExists:
+    """Tests for --skip-if-exists behavior."""
+
+    def _make_task_dir(self, tmp_path: Path, name: str) -> Path:
+        d = tmp_path / name
+        d.mkdir()
+        (d / "script.sh").write_text("#PBS -l nodes=1:ppn=48\n")
+        return d
+
+    def test_skip_if_exists_exact_name(self, tmp_path):
+        d1 = self._make_task_dir(tmp_path, "done")
+        (d1 / "cal.out").write_text("CP2K output")
+        d2 = self._make_task_dir(tmp_path, "todo")
+
+        tasks = scan_directory(tmp_path, skip_if_exists=["cal.out"])
+        by_name = {t.name: t for t in tasks}
+        assert by_name["done"].status == TaskStatus.SKIPPED
+        assert "Pre-existing: cal.out" in by_name["done"].error_message
+        assert by_name["todo"].status == TaskStatus.PENDING
+
+    def test_skip_if_exists_glob(self, tmp_path):
+        d1 = self._make_task_dir(tmp_path, "a")
+        (d1 / "sp.inp").write_text("dummy")
+        (d1 / "sp.out").write_text("dummy output")
+        d2 = self._make_task_dir(tmp_path, "b")
+        (d2 / "sp.inp").write_text("dummy")
+
+        tasks = scan_directory(tmp_path, skip_if_exists=["*.out"])
+        by_name = {t.name: t for t in tasks}
+        assert by_name["a"].status == TaskStatus.SKIPPED
+        assert by_name["b"].status == TaskStatus.PENDING
+
+    def test_skip_if_exists_multiple_patterns_first_match(self, tmp_path):
+        d = self._make_task_dir(tmp_path, "task")
+        (d / "time").write_text("END Time:")
+
+        tasks = scan_directory(
+            tmp_path, skip_if_exists=["cal.out", "time", "*.done"]
+        )
+        assert tasks[0].status == TaskStatus.SKIPPED
+        assert "Pre-existing: time" in tasks[0].error_message
+
+    def test_skip_if_exists_no_match_pending(self, tmp_path):
+        self._make_task_dir(tmp_path, "task")
+        tasks = scan_directory(
+            tmp_path, skip_if_exists=["nonexistent.out"]
+        )
+        assert tasks[0].status == TaskStatus.PENDING
+
+    def test_skip_if_exists_empty_list_is_noop(self, tmp_path):
+        self._make_task_dir(tmp_path, "task")
+        tasks = scan_directory(tmp_path, skip_if_exists=[])
+        assert tasks[0].status == TaskStatus.PENDING
+
+    def test_skip_if_exists_takes_priority_over_missing_script(self, tmp_path):
+        """If disk says 'done', we don't care that the script is missing."""
+        d = tmp_path / "task"
+        d.mkdir()
+        # NO script.sh
+        (d / "cal.out").write_text("CP2K output")
+
+        tasks = scan_directory(tmp_path, skip_if_exists=["cal.out"])
+        assert tasks[0].status == TaskStatus.SKIPPED
+        assert "Pre-existing: cal.out" in tasks[0].error_message
+
+    def test_skip_if_exists_nested_glob(self, tmp_path):
+        d = self._make_task_dir(tmp_path, "task")
+        sub = d / "output"
+        sub.mkdir()
+        (sub / "done.marker").write_text("")
+
+        tasks = scan_directory(
+            tmp_path, skip_if_exists=["output/done.marker"]
+        )
+        assert tasks[0].status == TaskStatus.SKIPPED

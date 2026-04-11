@@ -164,6 +164,7 @@ pbs-auto submit traj_051/ ... --name mlip_round1_g51_77
 | `--script-name NAME` | PBS 脚本文件名（默认 `script.sh`） |
 | `--queue NAME` | 强制所有任务使用指定队列 |
 | `--no-queue-validation` | 跳过队列合规性检查 |
+| `--skip-if-exists GLOB` | 若任务目录下匹配此 glob → 标 SKIPPED。可重复。与 config `[defaults].skip_if_exists` 取并集 |
 
 **batch_id 生成规则**：
 - 有 `--name`：`sha256(name)[:16]`
@@ -388,6 +389,27 @@ pbs-auto submit ./workdir --fresh
 ```bash
 pbs-auto submit ./workdir --foreground
 ```
+
+### 跳过已完成的任务
+
+在首次跑一批之后，部分子目录可能已经完成（`cal.out` / `time` / 自定义标记存在），重跑时想跳过。
+
+**CLI 一次性**：
+```bash
+pbs-auto submit sp_data/{051..077} --name x \
+  --skip-if-exists cal.out \
+  --skip-if-exists time
+```
+
+**config.toml 持久化**：
+```toml
+[defaults]
+skip_if_exists = ["cal.out", "time"]
+```
+
+Glob 模式相对任务目录展开（支持 `*.out`、`output/done.marker` 等嵌套路径）。任何一个匹配即 SKIPPED + `Pre-existing: <pattern>` 原因。检查先于脚本解析，所以缺 `script.sh` 但已有 `cal.out` 的目录也会被跳过。
+
+**局限**：只看文件存在与否，不校验内容。如果担心 crashed 留下的部分输出被误判为完成，用更精确的标记（如 `time.finished` 或自己写的 completion sentinel）而不是 `*.out`。
 
 ### 从文件读 workdir 列表
 

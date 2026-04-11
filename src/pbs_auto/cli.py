@@ -64,6 +64,17 @@ def cli():
 @click.option("--script-name", default=None, help="PBS script filename")
 @click.option("--queue", "cli_queue", default=None, help="Force queue for all tasks")
 @click.option("--no-queue-validation", is_flag=True, help="Skip queue compliance checks")
+@click.option(
+    "--skip-if-exists",
+    "skip_if_exists_cli",
+    multiple=True,
+    metavar="GLOB",
+    help=(
+        "Glob pattern (relative to each task dir); if any matches an "
+        "existing file, the task is marked SKIPPED. Can be repeated. "
+        "Unioned with config.toml [defaults].skip_if_exists."
+    ),
+)
 def submit(
     root_dirs,
     name,
@@ -76,6 +87,7 @@ def submit(
     script_name,
     cli_queue,
     no_queue_validation,
+    skip_if_exists_cli,
 ):
     """Scan ROOT_DIRS and submit PBS tasks (daemonizes by default)."""
     from pbs_auto.batch_store import (
@@ -146,11 +158,25 @@ def submit(
         console.print(f"[red]{e}[/red]")
         raise SystemExit(1)
 
+    # --- Resolve skip_if_exists (config defaults + CLI, unioned) ---
+    skip_patterns: list[str] = list(config.skip_if_exists)
+    for p in skip_if_exists_cli:
+        if p not in skip_patterns:
+            skip_patterns.append(p)
+
     # --- Scan directories ---
     console.print(f"Scanning {len(roots)} root dir(s)...")
+    if skip_patterns:
+        console.print(
+            f"Skip patterns: [dim]{', '.join(skip_patterns)}[/dim]"
+        )
     tasks = []
     for root in roots:
-        tasks.extend(scan_directory(Path(root), config.script_name))
+        tasks.extend(
+            scan_directory(
+                Path(root), config.script_name, skip_if_exists=skip_patterns
+            )
+        )
     if not tasks:
         console.print("[yellow]No task directories found.[/yellow]")
         return

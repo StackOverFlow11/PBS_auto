@@ -97,19 +97,44 @@ def parse_cores_from_script(script_path: Path) -> int | None:
     return resources.cores
 
 
+def _matches_skip_pattern(subdir: Path, patterns: list[str]) -> str | None:
+    """Return the first pattern that matches an existing file under subdir.
+
+    Patterns are glob-relative to the task directory (e.g. "cal.out",
+    "*.out", "output/done"). Returns None if nothing matches.
+    """
+    for pattern in patterns:
+        try:
+            matches = list(subdir.glob(pattern))
+        except (OSError, ValueError):
+            continue
+        if matches:
+            return pattern
+    return None
+
+
 def scan_directory(
-    root: Path, script_name: str = "script.sh"
+    root: Path,
+    script_name: str = "script.sh",
+    skip_if_exists: list[str] | None = None,
 ) -> list[Task]:
     """Scan root directory for task subdirectories.
 
     Each immediate subdirectory containing script_name is treated as a task.
     Returns tasks sorted in natural order by directory name.
+
+    If skip_if_exists is provided, any subdirectory containing at least
+    one file matching any of the glob patterns is marked SKIPPED with a
+    "Pre-existing" reason. The check runs BEFORE script parsing, so a
+    task with an unparseable script is still skipped if its disk state
+    already looks complete.
     """
     root = root.resolve()
     if not root.is_dir():
         raise FileNotFoundError(f"Root directory not found: {root}")
 
     tasks: list[Task] = []
+    skip_patterns = list(skip_if_exists) if skip_if_exists else []
 
     subdirs = [d for d in root.iterdir() if d.is_dir()]
     subdirs.sort(key=lambda d: natural_sort_key(d.name))
@@ -121,6 +146,17 @@ def scan_directory(
             directory=str(subdir),
             script_name=script_name,
         )
+
+        # Pre-existing output check runs first so that previously
+        # completed tasks are skipped even if the script is missing
+        # or unparseable.
+        if skip_patterns:
+            matched = _matches_skip_pattern(subdir, skip_patterns)
+            if matched is not None:
+                task.status = TaskStatus.SKIPPED
+                task.error_message = f"Pre-existing: {matched}"
+                tasks.append(task)
+                continue
 
         if not script_path.exists():
             task.status = TaskStatus.SKIPPED

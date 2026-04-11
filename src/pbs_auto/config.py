@@ -112,6 +112,10 @@ class AppConfig:
     submit_delay: int = 2
     post_submit_check_delay: int = 60
     early_exit_threshold: int = 30
+    # Glob patterns (relative to each task directory) that, if matched,
+    # cause the task to be marked SKIPPED with a "Pre-existing" reason.
+    # CLI `--skip-if-exists` values are unioned with this list.
+    skip_if_exists: list[str] = field(default_factory=list)
     servers: dict[str, ServerConfig] = field(default_factory=dict)
 
     def get_server(self, name: str | None = None) -> ServerConfig:
@@ -195,6 +199,11 @@ def _parse_config(raw: dict) -> AppConfig:
             queues=queues,
         )
 
+    skip_if_exists_raw = defaults.get("skip_if_exists", [])
+    if isinstance(skip_if_exists_raw, str):
+        skip_if_exists_raw = [skip_if_exists_raw]
+    skip_if_exists = [str(p) for p in skip_if_exists_raw]
+
     return AppConfig(
         server=defaults.get("server", "server1"),
         script_name=defaults.get("script_name", "script.sh"),
@@ -202,6 +211,7 @@ def _parse_config(raw: dict) -> AppConfig:
         submit_delay=defaults.get("submit_delay", 2),
         post_submit_check_delay=defaults.get("post_submit_check_delay", 60),
         early_exit_threshold=defaults.get("early_exit_threshold", 30),
+        skip_if_exists=skip_if_exists,
         servers=servers,
     )
 
