@@ -452,6 +452,117 @@ Daemon 启动时自检锁服务失败。联系集群管理员启用 `rpc.lockd` 
 
 崩溃窗口 3 的提示：qsub 成功但哨兵 update 未完成。日志会报告 job_id，需要手动 `qdel <job_id>` 避免该任务重复运行（pbs-auto 会在下轮重新提交相同内容）。
 
+### Daemon 跑起来了但只用到部分配额（slot 数不对）
+
+**症状**：`qstat -u $USER` 显示 running 核数远低于预期。比如明明应该 5 × 48 = 240 核，实际只有 4 × 48 = 192。
+
+**根因**：`defaults.server` 指向了错的 server profile。你的 config.toml 可能同时定义了 `[servers.server1]`（max_running=192）和 `[servers.server2]`（max_running=240），但 `[defaults]` 里 `server = "server1"`（从另一个集群复制来的），daemon 就按 server1 节流。
+
+**检查**：
+```bash
+# 看 config 选定的 server 实际值
+python -c "
+from pbs_auto.config import load_config
+c = load_config()
+s = c.get_server()
+print(f'{c.server}: max_run={s.max_running_cores} max_queued={s.max_queued_cores}')
+"
+```
+
+**修复**（二选一）：
+1. 改 `~/.config/pbs_auto/config.toml` 的 `[defaults].server = "server2"`，然后 `stop` + 重新 `submit`（daemon 会从 state.json 恢复，在跑的 PBS 作业不受影响）
+2. 单次 submit 加 `--server server2` 显式指定
+
+**另外**：提前用 `qmgr -c 'list server' | grep "u:$USER"` 查 PBS 实际配额，保证 config 里的 `max_running_cores` / `max_queued_cores` 和真实值一致。低估则 daemon 过早停止提交、队列深度浪费；高估则 qsub 频繁遭 `would exceed ncpus`（会 retry 不丢任务，但日志噪音大）。
+
+### Stop + 改 config + restart 后 `status` 显示的 `Server:` 没变
+
+**症状**：你停了 daemon、改了 `defaults.server`、重新 submit，`pbs-auto status` 还是显示原来的 server 名字。
+
+**原因**：`state.json` 里的 `server_profile` 是 **首次创建 batch 时的 profile 名**，stop/restart 不会重写这个字段（它只是元数据，不参与资源决策）。Daemon 实际行为已经用新 config，可以通过 `qstat -u $USER` 确认 running 核数符合新配额。
+
+**判断实际用的 config**：
+- 看 qstat running 核数是否匹配新 `max_running_cores`
+- 看 `pbs-auto logs <name> --tail 50` 是否出现对应配额的提交节奏
+
+不想看到陈旧的 display，可以 `--fresh` 重建 batch，但会丢失已提交任务的历史。通常忍一下就行——只是 display 陈旧，非 bug。
+
+### 跨集群脚本复制后 `module load intel` 不工作
+
+**症状**：从 chem-hpc 复制过来的 `script.sh` 到 group-hpc 提交后秒退 WARNING，`*.out` 里报 `Module intel not found`（或 module command 静默失败，任务看似启动但实际没加载编译器）。
+
+**原因**：两集群 Intel module 命名不同：
+- **chem-hpc**: `module load intel`
+- **group-hpc**: `module load intel-2023.2`
+
+**批量修复**（只改 module 行，不动其他逻辑）：
+```bash
+cd <target_parent_dir>
+find . -name script.sh -type f -print0 | xargs -0 sed -i \
+  -e 's|^module load intel$|module load intel-2023.2|' \
+  -e 's|^module unload intel$|module unload intel-2023.2|'
+```
+
+**验证**：
+```bash
+grep -rh 'module load intel' --include=script.sh <target> | sort -u
+# 应该只看到 'module load intel-2023.2'
+```
+
+反向（group-hpc → chem-hpc）同理，sed 反过来。一次性确认两边 module 名称的权威做法：先在目标集群 `module avail intel` 看可用列表。
+
+### `pbs-auto: command not found` / PATH 问题
+
+**症状**：`pip install --user -e .` 成功后直接敲 `pbs-auto` 报 command not found。
+
+**原因**：`pip install --user` 装到 `~/.local/bin/`，多数集群登录 shell 默认不把 `~/.local/bin` 加进 PATH。
+
+**修复**（三选一）：
+1. 把 `~/.local/bin` 加到 `~/.bashrc` 的 PATH: `export PATH="$HOME/.local/bin:$PATH"`
+2. 用 conda env：`conda activate md_env && pbs-auto ...`
+3. 一次性：`conda run -n md_env pbs-auto ...`
+
+推荐用 conda env 方式，因为它把 pbs-auto 与 Python runtime 绑定，避免多个 Python 版本下 entry point 互相污染。
+
+### 从本地直接查远程 daemon
+
+`pbs-auto` 本身只在安装了它的机器上工作，本地 Linux 机器通常没装。想要从本地一条命令查远程状态，建个 wrapper：
+
+```bash
+# ~/bin/gpbs  (chmod +x)
+#!/bin/bash
+ssh group-hpc "conda run -n md_env pbs-auto $*"
+```
+
+然后本地 `gpbs status mlip_round1_g71_77` 就等价于 ssh 过去执行。
+
+### `submit sp_data/{051..077}` 只识别 1 个目录
+
+**症状**：命令行用 brace expansion 写了 27 个目录，pbs-auto 只说 `Scanning 1 root dir(s)`。
+
+**原因**：你可能用的是 zsh/fish 或者默认 sh，brace expansion `{051..077}` 是 **bash 4+ 特性**，其他 shell 不展开。
+
+**检查**：
+```bash
+echo sp_data/{051..077}
+# bash 输出 27 个路径；zsh/fish 可能按字面传递
+```
+
+**修复**：
+1. 显式用 bash：`bash -c 'pbs-auto submit sp_data/{051..077} --name x'`
+2. 或用 `--from-list file`：把 27 条路径写进一个文件
+3. 或 shell 内手写 seq：`pbs-auto submit $(seq -f "sp_data/0%02g" 51 77) --name x`（注意需要 bash/zsh 的 $(...)）
+
+### `Multiple root directories require --name` 但你只给了一个
+
+**症状**：`pbs-auto submit ./workdir --name x` 报这个错。
+
+**原因**：你写错了 `--name` 位置或拼写？实际 **单 root 不需要 --name**，batch_id 从路径哈希。
+
+**更常见**：brace expansion 正常展开成多个路径，你忘了加 `--name`。给就行。
+
+**注意**：相同路径重复出现会被去重（`sp_data/051 sp_data/051 → 1 root`），所以显式重复不会触发 `--name` 要求。
+
 ## 参考资料
 
 - **架构**：`context4agent/architecture.md`
