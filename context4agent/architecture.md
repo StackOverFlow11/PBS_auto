@@ -10,7 +10,7 @@ PBS_auto/
 │   ├── architecture.md               # 本文件 - 项目架构总览
 │   ├── modules.md                    # 各模块详细说明
 │   ├── queue-validation.md           # 队列验证模块说明
-│   ├── state-machine.md              # 任务状态机文档
+│   ├── state-machine.md              # 任务状态机 + crash recovery windows
 │   └── testing.md                    # 测试策略与用例说明
 ├── docs/
 │   └── usage.md                      # 面向用户的使用文档
@@ -27,112 +27,160 @@ PBS_auto/
 ├── src/pbs_auto/                     # 源代码
 │   ├── __init__.py                   # 版本号 (__version__)
 │   ├── __main__.py                   # python -m pbs_auto 入口
-│   ├── cli.py                        # Click CLI 命令定义
+│   ├── cli.py                        # Click CLI 命令定义 (含 run_dry_run)
 │   ├── config.py                     # 配置加载与验证
-│   ├── models.py                     # 数据模型 (核心类型定义)
-│   ├── state.py                      # JSON 持久化
+│   ├── models.py                     # 数据模型 (Task, BatchState + 索引)
+│   ├── state.py                      # JSON load/save + migration + reconcile + identifier
+│   ├── batch_store/                  # 磁盘布局 + 哨兵 + 轮转 + mutation (package)
+│   │   ├── __init__.py               # 公开 API facade + __all__
+│   │   ├── _paths.py                 # 路径 + migrate_layout
+│   │   ├── _sentinels.py             # 哨兵 CRUD + recover
+│   │   ├── _rotation.py              # 日志轮转
+│   │   └── _mutation.py              # BatchStore + _MutationContext
 │   ├── scanner.py                    # 目录扫描 + 脚本解析
-│   ├── queue.py                     # 队列验证与自动选择
+│   ├── queue.py                      # 队列验证与自动选择
 │   ├── pbs.py                        # PBS 交互 (qsub/qstat/q)
-│   ├── scheduler.py                  # 提交引擎 (主循环)
-│   └── display.py                    # Rich Live CLI 界面
-└── tests/                            # 单元测试 (~89 个)
+│   ├── scheduler.py                  # 提交引擎 (主循环, 零 Rich)
+│   └── daemon.py                     # 双 fork + fcntl.lockf + PID
+└── tests/                            # 单元测试 (177 个)
     ├── conftest.py                   # 共享 fixtures
-    ├── test_config.py                # 配置测试 (13)
-    ├── test_scanner.py               # 扫描器测试 (15)
-    ├── test_pbs.py                   # PBS 解析测试 (8)
-    ├── test_queue.py                 # 队列验证测试 (21)
-    ├── test_scheduler.py             # 调度器测试 (10)
-    └── test_state.py                 # 持久化测试 (12)
+    ├── test_config.py
+    ├── test_scanner.py
+    ├── test_pbs.py
+    ├── test_queue.py
+    ├── test_scheduler.py
+    ├── test_state.py                 # JSON/migration/reconcile/identifier
+    └── test_batch_store.py           # paths/sentinels/mutation/rotation
 ```
 
 ## 模块依赖图
 
 ```
-cli.py ──────────────────────────┐
-  │                              │
-  ├─→ config.py                  │
-  ├─→ scanner.py ─→ models.py   │
-  ├─→ queue.py ──→ models.py    │
-  │               → config.py   │
-  ├─→ state.py ──→ models.py    │
-  │               → config.py   │
-  ├─→ pbs.py ───→ models.py    │
-  │               → config.py   │
-  ├─→ scheduler.py              │
-  │     ├─→ config.py           │
-  │     ├─→ models.py           │
-  │     ├─→ pbs.py              │
-  │     ├─→ display.py          │
-  │     └─→ state.py            │
-  └─→ display.py ─→ models.py  │
-                    → config.py │
+cli.py ──────────────────────────────┐
+  │                                  │
+  ├─→ config.py                      │
+  ├─→ scanner.py ─→ models.py        │
+  ├─→ queue.py ──→ models.py, config │
+  ├─→ state.py ──→ models.py, config, batch_store
+  ├─→ pbs.py ───→ models.py, config  │
+  ├─→ batch_store/ ─→ models.py, config
+  ├─→ daemon.py ──→ batch_store (paths + rotation)
+  └─→ scheduler.py                   │
+        ├─→ models.py                │
+        ├─→ pbs.py                   │
+        ├─→ batch_store (BatchStore + recover_sentinels)
+        └─→ state.py (save_state via BatchStore._flush_now)
 ```
 
-依赖方向：`models.py` 是零依赖的基础层，`config.py` 仅依赖标准库 + tomli，其余模块均依赖这两个基础模块。
+- `models.py` 是零依赖基础层
+- `config.py` 仅依赖 stdlib + tomli
+- `batch_store/` 是「磁盘布局 + 哨兵 + 轮转 + mutation」的单一权威，暴露 facade 给外部
+- `state.py` 只负责 JSON load/save + migration + reconcile + identifier 解析
+- `scheduler.py` 零 Rich 导入（`run_dry_run` 已迁到 `cli.py`）
+- `daemon.py` 负责双 fork + PID + fcntl.lockf
 
 ## 核心数据流
 
 ```
-用户执行 pbs-auto submit ./workdir
+用户执行 pbs-auto submit dir1 dir2 --name mlip_round1
          │
-    cli.py: 加载配置 → 扫描目录 → 队列验证/分配 → 加载/创建状态
+    Parent process (cli.py:submit):
+      load_config → scan_directory × N → validate_queues → load_state + reconcile
+      save_state (bootstrap bypass #1) → is_daemon_alive? → daemonize()
          │
-    scheduler.py: 进入主循环
+    Grandchild (after double-fork):
+      setsid + umask(0o077) + chdir("/") + closerange(3, nofile)
+      maybe_rotate_log_on_startup → dup2 log_fd → stdin/dev/null
+      _verify_lockf_works(batch_dir)               # 自检 rpc.lockd
+      acquire_lock(batch_id)                       # fcntl.lockf EX|NB
+      write_pid_file(batch_id)                     # O_EXCL + btime
+      load_state(batch_id) → rebuild_indexes       # 权威 state
+      cleanup_stale_artifacts                      # 废 tempfile + orphan sentinel
+      recover_sentinels(state, pbs)                # 按 job_id 反查 (bypass #2)
+      pbs.invalidate_cache()
+      store = BatchStore(state)                    # 单一 mutation 入口
          │
-         ├── 1. _poll_status()
-         │      PBSClient.query_user_jobs() → qstat/q → 解析输出
-         │      对比内部状态与 PBS 实际状态 → 更新 Task.status
-         │
-         ├── 2. _submit_pending()
-         │      遍历 PENDING 任务
-         │      检查资源限额 (从 PBS 查询实时 R/Q 核数)
-         │      PBSClient.submit(task) → qsub → 获取 job_id
-         │
-         ├── 3. save_state()
-         │      BatchState → JSON → 原子写入文件
-         │
-         ├── 4. display.refresh()
-         │      Rich Live 面板更新
-         │
-         ├── 5. _all_done()? → 退出循环
-         │
-         └── 6. _sleep(poll_interval)
-                可被 SIGINT 中断
+    Main loop (scheduler.py):
+      while not _shutdown:
+          _poll_status()                           # 读 _active_set, mutate via store
+          _recovery_pending retry?
+          _submit_pending()                        # 读 _pending_set, mutate via store (eager)
+          store.maybe_debounced_flush()
+          _all_done_fast()? → break
+          _sleep(poll_interval)
+      finally: force_flush → close(lock_fd) → unlink PID
 ```
 
 ## 关键设计决策
 
 ### 1. 资源统计以 PBS 为准
 
-`_get_resource_usage()` 每次调用 `qstat` 获取用户所有作业的实时核数，而非仅统计本工具管理的任务。因为用户可能通过其他途径提交了作业。
+`_get_resource_usage()` 每次调用 `qstat` 获取用户所有作业的实时核数，而非仅统计本工具管理的任务。查询失败时保守返回 `(max, max)` 防止误提交。
 
-### 2. 原子写入
+### 2. 两级 flush 策略
 
-`state.py` 中的 `save_state()` 使用 `tempfile.mkstemp()` + `Path.replace()` 实现原子写入，防止中途断电导致状态文件损坏。
+- **eager**：`_submit_task` 成功后立即 flush（捕获 job_id，`write_summary=False` 省 IO）
+- **debounced**：`_poll_status` / `_handle_job_disappeared` 置 `_dirty=True`，主循环末尾 `maybe_debounced_flush` 统一落盘（最小间隔 1s）
+- **FAILED 提升**：`_MutationContext` 检测到 task.status == FAILED 时强制 eager flush
 
-### 3. 5 秒查询缓存
+### 3. 内容权威的 content-authoritative 哨兵
 
-`PBSClient` 内部缓存 `query_user_jobs()` 结果 5 秒，避免同一轮询周期内重复调用 qstat（`_poll_status` 和 `_submit_pending` 都需要查询）。每次轮询周期开始时调用 `invalidate_cache()` 强制刷新。
+- 哨兵文件名：`submitting/<xx>/<sha256(dir)[:24]>`（256 路分片 + 文件名防伪）
+- 内容严格 3 行：`<dir>\n<job_id|PENDING>\n<iso_ts>\n`
+- `create_sentinel` 在 qsub 前写入 PENDING；`update_sentinel_job_id` 在 qsub 成功后原子重写 line 2；clean exit 时**无条件**移除
+- 恢复：读内容 → 校验文件名 hash 匹配 → 按 job_id 直查 PBS → 命中则 attach 回 SUBMITTED
+- 崩溃窗口 3（qsub 后 / update 前）通过 **orphan PBS job WARN 扫描**报告用户手动 qdel
 
-### 4. 配置独立于项目目录
+### 4. 原子写入 + fsync
 
-配置文件在 `~/.config/pbs_auto/config.toml`，状态文件在 `~/.local/share/pbs_auto/batches/`，遵循 XDG Base Directory 规范，不污染项目目录。
+`state.save_state` 使用 `tempfile.mkstemp + fdopen + fsync + os.replace` 保证崩溃不坏数据。`write_summary=True` 时 **summary.json 先写，state.json 后写**；约定：summary 可能短暂比 state 新，list-batches 会短暂显示更新计数，下轮 debounced flush 追平。
 
-### 5. Batch ID 由目录路径哈希生成
+### 5. 5 秒查询缓存
 
-`generate_batch_id()` 对工作目录绝对路径做 SHA256 取前 16 字符，同一目录总是得到相同 ID，实现自动恢复。
+`PBSClient` 缓存 `query_user_jobs()` 结果 5 秒，避免同一轮询周期内重复 qstat。每次 poll 周期开始强制 `invalidate_cache()`。
 
-### 6. SIGINT 双击退出
+### 6. 配置独立于项目目录
 
-第一次 Ctrl+C 设置 `_shutdown` 标志，主循环会在当前操作完成后保存状态退出；第二次 Ctrl+C 触发 `KeyboardInterrupt` 强制退出。
+配置文件 `~/.config/pbs_auto/config.toml`，状态 `~/.local/share/pbs_auto/batches/<batch_id>/`，遵循 XDG 规范。新文件布局（每批一子目录）：
+
+```
+<batch_id>/                       0o700
+    state.json          0o600     # 权威状态 (compact JSON, version=2)
+    summary.json        0o600     # 快速列表缓存 (≤1 flush 陈旧)
+    daemon.pid          0o600     # "PID btime_ticks ISO"
+    daemon.lock         0o600     # fcntl.lockf by grandchild
+    .locktest           0o600     # 临时自检文件
+    daemon.log          0o600     # 50 MB 尺寸轮转
+    daemon.log.2025-0.gz          # 历史归档
+    submitting/         0o700     # 哨兵分片目录
+        ab/             0o700
+            abcd1234... 0o600     # 3 行内容
+```
+
+### 7. Batch ID
+
+- 无 `--name`：`sha256("\n".join(sorted(resolve(root))))[:16]`
+- 有 `--name`：`sha256(name)[:16]`
+- 旧版 `<batch_id>.json` 扁平文件由 `migrate_layout` 幂等搬迁到 `<batch_id>/state.json`
+
+### 8. Daemon 互斥 + 并发 submit race
+
+`fcntl.lockf(<batch>/daemon.lock, LOCK_EX | LOCK_NB)` 是并发的唯一权威门。PID 文件只是 UX 辅助（`is_daemon_alive` 用 PID + btime + cmdline 三重校验，防止内核 PID 复用）。两实例 submit 同一 batch，后者在 `_verify_lockf_works` + `acquire_lock` 失败后 log 退出。
+
+### 9. Flag-only 信号处理
+
+SIGINT / SIGTERM handler 只做 `self._shutdown = True`，所有 FS 操作留给主循环的 `try/finally` 块。`_submit_pending` 内部有 **inner shutdown check**，每次 `_submit_task` 返回后检查一次。
+
+### 10. NFSv3 要求
+
+`fcntl.lockf` 依赖 NFSv3 的 `rpc.lockd` / `nfslock` 服务。CentOS 7 默认启用；缺失时 `_verify_lockf_works` 在 daemon 启动时报错退出。NFSv4 更佳但非必需。
 
 ## 第三方依赖
 
 | 包 | 版本 | 用途 |
 |---|---|---|
 | click | >= 8.0 | CLI 框架 |
-| rich | >= 13.0 | 终端 UI (Live, Table, Panel, ProgressBar) |
+| rich | >= 13.0 | 终端 UI（Rich Table 一次性打印；**无 Live**） |
 | tomli | >= 2.0 | TOML 解析 (Python 3.10 无内置 tomllib) |
 | pytest | >= 7.0 | 测试 (dev 依赖) |
 

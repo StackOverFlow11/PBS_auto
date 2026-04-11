@@ -44,17 +44,27 @@
 | elapsed | str | 已运行时间 |
 | queue | str | 队列名 (long/medium/short) |
 
-#### `BatchState(dataclass)`
-一次批量提交会话的完整状态。
+#### `BatchState(dataclass)` — version 2 schema
+一次批量提交会话的完整状态。**tasks dict 的 key 是 task.directory 绝对路径**（不是 task.name），支持多 workdir 下跨父目录同名子目录。
+
+**派生索引**（`field(repr=False, compare=False)`，不序列化）：
+- `_pending_set: set[str]` — PENDING task 的 directory 集合
+- `_active_set: set[str]` — SUBMITTED/QUEUED/RUNNING task 的 directory 集合
+
+调用 `rebuild_indexes()` 在 `from_dict` 后和 reconcile 后全量重建；`BatchStore._update_indexes()` 在 mutation context 内部做增量维护。
+
+方法 `source_root_for(task)` 按最长前缀匹配 root_directories，用于多 workdir 任务溯源。
 
 | 字段 | 类型 | 说明 |
 |------|------|------|
-| batch_id | str | 由目录路径 SHA256 前 16 字符 |
-| root_directory | str | 工作目录绝对路径 |
+| batch_id | str | 由 sorted(resolve(roots)) 或 name 的 SHA256 前 16 字符 |
+| root_directories | list[str] | 工作目录绝对路径列表（多 workdir 支持） |
 | server_profile | str | 使用的服务器配置名 |
+| name | str \| None | 用户指定的 batch 名，多 root 时必填 |
+| version | int | schema 版本（当前为 2） |
 | created_at | str | 创建时间 ISO 格式 |
 | updated_at | str | 最后更新时间 ISO 格式 |
-| tasks | dict[str, Task] | 任务字典 (key = task.name) |
+| tasks | dict[str, Task] | 任务字典 (**key = task.directory 绝对路径**) |
 
 ---
 
@@ -201,82 +211,167 @@ Job ID          Username Queue    Jobname    SessID NDS TSK Memory Time  S Time
 
 ---
 
-## state.py — 持久化
+## state.py — JSON load/save + migration + reconcile + identifier
 
 **文件**: `src/pbs_auto/state.py`
-**依赖**: `config.py`, `models.py`
-**测试**: `tests/test_state.py` (12 个用例)
+**依赖**: `config.py`, `models.py`, `batch_store`
+**测试**: `tests/test_state.py` (38 个用例)
+
+**所有权边界**：JSON 序列化、schema migration、reconcile 逻辑、identifier 解析。磁盘布局（路径、权限、哨兵、轮转、mutation）由 `batch_store/` 包拥有。
+
+### 常量
+
+- `MAX_EAGER_SAVE_LATENCY_MS = 500` — eager save 延迟上限（`test_batch_store.py` 断言 15k 任务在此之内；超过则推荐 orjson 落地）
 
 ### 关键函数
 
-- `generate_batch_id(root_directory)`: SHA256(resolve(path))[:16]
-- `get_state_path(batch_id)`: `DEFAULT_STATE_DIR / f"{batch_id}.json"`
-- `save_state(state)`: JSON 序列化 + 原子写入 (mkstemp → write → replace)
-- `load_state(batch_id)`: 从 JSON 反序列化，不存在返回 None
-- `reconcile_tasks(saved, scanned)`: 合并已保存状态和新扫描结果
-  - COMPLETED/WARNING/FAILED/SKIPPED: 保持不变
-  - RUNNING/QUEUED: 保持不变（scheduler 会重新检查 PBS）
-  - SUBMITTED: 重置为 PENDING（无法验证 qsub 是否真的成功）
-  - 新任务: 添加为 PENDING
-  - 所有任务更新 cores、directory、nodes、queue（脚本可能被编辑）
-- `list_batches()`: 扫描状态目录，返回所有批次的摘要信息
+- `generate_batch_id(roots, name=None)`: 有 name → SHA256(name)[:16]；否则 SHA256("\n".join(sorted(resolve(r)))))[:16]。legacy 单字符串 root 仍支持
+- `validate_identifier(identifier)`: 字符集 `[A-Za-z0-9._-]{1,64}`；拒 `/`、`\`、`\x00`、前导 `-`、reserved names (`.`, `..`, `daemon.pid`, `daemon.lock`, `daemon.log`, `state.json`, `summary.json`, `submitting`, `.orig`, `.tmp`)
+- `resolve_batch_identifier(identifier)`: 解析顺序 → exact batch_id → prefix match → name match via summary.json/state.json
+- `_migrate_on_load(raw)`: 幂等 v1→v2 升级，重命名 `root_directory` → `root_directories`，按 directory 重建 tasks dict key
+- `save_state(state, write_summary=True)`:
+  - `json.dumps(..., separators=(",",":"), ensure_ascii=False)` — compact，无 indent
+  - `_atomic_write`: `tempfile.mkstemp` → `fchmod(0o600)` → `write` → `fsync` → `replace`
+  - 顺序：summary.json 先写，state.json 后写（约定：summary 可比 state 新 ≤1 flush）
+  - `write_summary=False` 用于 eager qsub 保存，降低 IO
+- `load_state(batch_id)`: 调 `migrate_layout` 尝试搬迁 legacy flat file → 读 state.json → `_migrate_on_load` → `BatchState.from_dict` → `rebuild_indexes`
+- `reconcile_tasks(saved, scanned)`: 按 `task.directory` 匹配；**bug fix**：SUBMITTED 有 job_id 保持不变（只有无 job_id 时才重置为 PENDING），结束后 `rebuild_indexes`
+- `list_batches()`: 优先读 `<batch_id>/summary.json`，缺失降级读 state.json
 
 ---
 
-## scheduler.py — 提交引擎
+## batch_store/ — 磁盘布局 + 哨兵 + 轮转 + mutation (NEW package)
+
+**位置**: `src/pbs_auto/batch_store/`
+**依赖**: `models.py`, `config.py`
+**测试**: `tests/test_batch_store.py` (29 个用例)
+
+**所有权边界**（与 state.py 对称）：磁盘布局、权限、哨兵 CRUD、日志轮转、mutation 生命周期。JSON load/save + migration + reconcile + identifier 由 `state.py` 拥有。
+
+### `_paths.py`
+
+路径函数：`get_batch_dir / get_state_path / get_summary_path / get_pid_path / get_lock_path / get_log_path / get_sentinel_dir`。`ensure_batch_dir` 在 daemon startup audit 目录权限（< 0o700 时 chmod 收紧）。
+
+`migrate_layout(batch_id)` 幂等 5 分支：
+1. `<id>/state.json` 存在 → noop
+2. `<id>.json` symlink → 拒绝（RuntimeError）
+3. `<id>.json` + 新目录不存在 → mkdir + `os.replace`
+4. `<id>.json` + 新目录空 → `os.replace`
+5. 两者都有 → 备份 legacy 为 `.orig` 并警告
+
+### `_sentinels.py` (content-authoritative)
+
+- `sentinel_key(dir) = sha256(dir)[:24]` — 96 bits 防碰撞
+- `sentinel_path(batch_id, dir)` → `<batch>/submitting/<key[:2]>/<key>` (256 分片)
+- 3 行 ASCII 严格内容：`<abs_dir>\n<job_id|PENDING>\n<iso_ts>\n`
+- `create_sentinel(batch_id, task)`: `tempfile.mkstemp + fchmod(0o600) + fsync + replace`，内容 line 2 = `PENDING`
+- `update_sentinel_job_id(path, job_id)`: 原子重写 line 2，保留 line 1，刷新 line 3
+- `remove_sentinel(path)`: `unlink(missing_ok=True)`
+- `read_sentinel(path)`: 严格 3 行解析，dir ≤4096，job_id 正则 `^(PENDING|[0-9]+(\.[A-Za-z0-9._-]+)?)$`，iso ts 正则；畸形返回 None
+- `iter_sentinels(batch_id)`: 遍历分片目录，跳过 `*.tmp`
+- `cleanup_stale_artifacts(batch_id, state, max_tmp_age_s=60)`: startup 唯一调用。删除 batch 根下的 tempfiles（age > max）+ 孤儿 sentinel（其 key 不在 state 任何 PENDING task 上）
+- **`recover_sentinels(state, pbs) -> bool`**：启动时调用，返回 True 表示 state 已变更
+  1. 建 reverse index `key → task`
+  2. query PBS，失败 → return False（caller 设 `_recovery_pending`）
+  3. 遍历 sentinels：
+     - task 不存在或非 PENDING → unlink
+     - 解析失败 → unlink
+     - filename hash ≠ content dir hash → 防伪失败 unlink
+     - body == "PENDING" → qsub 未返回 → unlink
+     - body 有 job_id 且 PBS 命中 (state in {Q,R,H,W}) → attach 成 SUBMITTED
+  4. Orphan PBS job 扫描：job name startswith `pa_<batch_id[:6]>` 且 id 未被引用 → log WARN 让用户手动 qdel
+  5. 有 change 则 rebuild_indexes + save_state (bypass)
+
+### `_rotation.py` (daemon-only)
+
+- `MAX_LOG_SIZE = 50 MB`, `MAX_LOG_AGE_DAYS = 365`
+- `maybe_rotate_log_on_startup(batch_id)`: 打开 log fd **前**，size 或 age 超阈则 archive
+- `maybe_rotate_log_in_loop(batch_id, fd)`: 主循环定期调用；`fstat(fd)` → 超尺寸则 rename → `gzip.open(gz, "xb")` → `os.open` 新 fd → `dup2` 到 1/2 → `close(旧 fd)` → 返回新 fd
+- 归档名 `daemon.log.<YYYY>-<N>.gz`，`xb` 模式 + 递增 N 避免同年冲突
+
+### `_mutation.py` — BatchStore + _MutationContext
+
+**`BatchStore(state)`**：per-process 唯一 mutation 入口。字段：`state`, `_dirty=False`, `_last_flush_mono=time.monotonic()`, `_min_debounce_interval=1.0`。
+
+API：
+- `mutate(task=None, flush="debounced") -> _MutationContext`
+- `maybe_debounced_flush()`: dirty 且距上次 flush ≥ `_min_debounce_interval` 时才 `_flush_now(write_summary=True)`
+- `force_flush()`: 立即 `_flush_now(write_summary=True)`
+- `_flush_now(write_summary)`: `try: save_state except OSError: log + keep _dirty`；成功清 dirty
+- `_update_indexes(task)`: 增量维护 `_pending_set` / `_active_set`
+
+**`_MutationContext`**：绝不抛异常，每步 try/except log-and-continue。`__exit__` 流程：
+1. 异常路径 → 留下 sentinel → return False
+2. sentinel 内容同步：task.job_id 非空 → `update_sentinel_job_id`
+3. 索引增量更新
+4. flush 策略：`task.status == FAILED` → 强制 eager；eager → `_flush_now(write_summary=False)`；debounced → 仅置 `_dirty=True`
+5. **无条件**删除 sentinel（clean exit 意味着 sentinel 职责完成；retryable-PENDING 下轮循环会重建）
+
+---
+
+## scheduler.py — 提交引擎（零 Rich）
 
 **文件**: `src/pbs_auto/scheduler.py`
-**依赖**: 所有其他模块
-**测试**: `tests/test_scheduler.py` (10 个用例)
+**依赖**: `batch_store`, `config`, `models`, `pbs`
+**测试**: `tests/test_scheduler.py` (18 个用例)
 
 ### Scheduler 类
 
-核心调度器，管理完整的提交生命周期。
+核心调度器。`run_dry_run` 已迁到 `cli.py`，scheduler 零 `from rich` 导入。
 
 #### 构造参数
 
 ```python
-Scheduler(state, config, server, pbs, display, dry_run=False)
+Scheduler(state, config, server, pbs, store: BatchStore, dry_run=False)
 ```
 
 #### 主循环 `_main_loop()`
 
 ```
-while not shutdown:
-    _poll_status()      # 查询 PBS，更新任务状态
-    _submit_pending()   # 提交等待中的任务
-    save_state()        # 持久化状态
-    display.refresh()   # 更新显示
-    if _all_done(): break
-    _sleep(interval)    # 可中断的等待
+try:
+  while not _shutdown:
+    _poll_status()                         # 读 _active_set, mutate via store (debounced)
+    if _recovery_pending: recover_sentinels retry
+    if _shutdown: break                    # inner check
+    _submit_pending()                      # 读 _pending_set, mutate via store (eager)
+    store.maybe_debounced_flush()          # 本轮合并 flush
+    if _all_done_fast(): break
+    _sleep(poll_interval)
+finally:
+  try: store.force_flush()                 # 最终快照
 ```
 
-#### 状态转换逻辑 `_poll_status()`
+#### 信号处理
 
-对每个有 job_id 的非终态任务：
-- PBS 中有 job，state == "R" → RUNNING（记录 start_time）
-- PBS 中有 job，state == "Q" → QUEUED
-- PBS 中无 job → `_handle_job_disappeared()`
+Flag-only：SIGINT / SIGTERM 只设 `_shutdown = True`，所有 FS 操作留给主循环 `try/finally`。
 
-#### 消失处理 `_handle_job_disappeared(task)`
+#### 状态转换 `_poll_status()` / `_handle_job_disappeared()`
 
-- 状态为 SUBMITTED（从未看到运行）→ WARNING
-- 有 start_time 且运行 < early_exit_threshold → WARNING
-- 否则 → COMPLETED
-
-#### 资源检查 `_get_resource_usage()`
-
-从 PBS 查询实时资源使用（非仅内部状态），返回 `(running_cores, queued_cores)`。
-查询失败时返回 `(max_running, max_queued)` 防止误提交。
+不变；但所有 mutation 都包在 `with store.mutate(task=t, flush="debounced"):` 里。遍历 `self.state.tasks.items()` 并按 `_active_set` 过滤以保证确定性顺序。
 
 #### 提交逻辑 `_submit_pending()`
 
-遍历 PENDING 任务，每个任务提交前检查：
-- running_cores + task.cores <= max_running_cores
-- queued_cores + task.cores <= max_queued_cores
-- 不满足则 `continue`（跳过，等下个周期）
+遍历 `state.tasks` 按 `_pending_set` 过滤。每次 `_submit_task(task)` 返回后检查 `_shutdown`（inner check）。retryable error → `break`。
 
-提交后调用 `invalidate_cache()` 因为队列状态已变化。
+`_submit_task(task) -> bool` 使用 `with store.mutate(task=task, flush="eager"):` 包住整个 qsub 调用。FileNotFoundError / 非 retryable → FAILED；retryable → 保持 PENDING 返回 False；成功 → SUBMITTED + job_id + submit_time。
+
+---
+
+## daemon.py — 双 fork + fcntl.lockf + PID (NEW)
+
+**文件**: `src/pbs_auto/daemon.py`
+**依赖**: `batch_store` (paths + rotation)
+**测试**: 验证脚本级 fork 不在单测中执行；helper 函数用 monkeypatch 的 /proc 和 fcntl stub 测试（待补）
+
+### 关键函数
+
+- `daemonize(batch_id)`: flush stdio → fork → setsid → fork → chdir("/") → `umask(0o077)` → `closerange(3, max_fd)` → `maybe_rotate_log_on_startup` → open log fd O_WRONLY|O_CREAT|O_APPEND 0o600 → stdin ← /dev/null, 1/2 ← log。只有 grandchild 返回 log_fd
+- `_verify_lockf_works(batch_dir)`: 开 `.locktest` O_EXCL 0o600 → `lockf(EX|NB)` → `LOCK_UN` → close → unlink。任何 OSError 抛 RuntimeError「NFSv3 需 rpc.lockd」
+- `acquire_lock(batch_id) -> int`: 开 `daemon.lock` O_WRONLY|O_CREAT 0o600 → `lockf(EX|NB)`；失败 raise RuntimeError（另一实例持锁）；成功返回 fd（**不关闭**，kernel 在进程死时自动释放）
+- `write_pid_file(batch_id)`: `/proc/<pid>/stat` 读 btime_ticks → O_EXCL 0o600 写 `"PID btime ISO\n"`
+- `_read_proc_starttime(pid)`: 解析 `/proc/<pid>/stat`，从最后一个 `)` 切片避开 `(comm)` 里的空格，字段索引 19（post-comm）= field 22（全局，1-based）= starttime
+- `is_daemon_alive(batch_id)`: PID 文件 + `os.kill(pid, 0)` + btime 匹配 + cmdline 含 `pbs-auto`
+- `stop_daemon(batch_id, timeout=60.0)`: 校验同进程 → SIGTERM → 0.5s 轮询等 PID 消失
 
 当 `_submit_task()` 返回 `False`（可重试错误）时，`break` 停止本轮提交。
 
@@ -297,80 +392,61 @@ while not shutdown:
 - 第一次 → `_shutdown = True`，主循环自然退出
 - 第二次 → 恢复原始处理器并 `raise KeyboardInterrupt`
 
-### `run_dry_run(state, server)`
+---
 
-独立函数，使用 Rich Table 显示计划但不执行。
+## display.py — DELETED
+
+本模块已删除。实时 Rich Live 面板不再维护，`status` 命令改用 summary.json 一次性快照。
 
 ---
 
-## display.py — CLI 界面
-
-**文件**: `src/pbs_auto/display.py`
-**依赖**: `config.py`, `models.py`, `rich`
-**测试**: 无直接测试（UI 层）
-
-### Display 类
-
-使用 `rich.live.Live` 实现实时刷新终端界面。
-
-#### 布局组成
-
-```
-╭─ PBS Auto-Submit — Server Name ──────────────────────╮
-│ Running Cores:  ████████░░░░░░░░░░░░  96/240         │
-│ Queued Cores:   ██████░░░░░░░░░░░░░░  48/192         │
-│                                                       │
-│ Total: 10 | Pending: 3 | Running: 2 | Completed: 5  │
-│                                                       │
-│ Name     Cores  Queue   Status    Job ID    Elapsed   │
-│ task_1      48  long    running   371824    1h23m45s  │
-│ task_2      48  medium  queued    371825    5m30s     │
-│                                                       │
-│ Elapsed: 02:15:30 | Last update: 14:23:45            │
-╰──────────────────────────────────────────────────────╯
-```
-
-#### 方法
-
-- `start()`: 启动 Live 刷新
-- `stop()`: 停止 Live 刷新
-- `refresh(state, server)`: 构建并更新面板
-- `_build_resource_section()`: 进度条，< 80% 绿 / < 100% 黄 / 100% 红
-- `_build_status_summary()`: 各状态计数单行摘要
-- `_build_active_table()`: 活跃任务表；无活跃任务时显示最近 5 个终态任务
-- `_build_timing()`: 累计耗时 + 当前时间
-- `_calc_elapsed()`: 根据任务状态计算合适的耗时
-
----
-
-## cli.py — 命令行入口
+## cli.py — 命令行入口（含 run_dry_run）
 
 **文件**: `src/pbs_auto/cli.py`
 **依赖**: 所有其他模块 (延迟导入)
-**测试**: 通过 CLI 集成测试
+**测试**: 通过端到端 dry-run 集成测试
 
 ### 命令
 
 | 命令 | 函数 | 说明 |
 |------|------|------|
-| `submit <root_dir>` | `submit()` | 主命令：扫描+提交+监控 |
-| `status <root_dir>` | `status()` | 查看批次状态 |
+| `submit [ROOT_DIRS]...` | `submit()` | 扫描 + 提交；默认双 fork daemon |
+| `status <name\|batch_id>` | `status()` | 一次性快照（读 summary.json）|
+| `stop <name\|batch_id>` | `stop()` | SIGTERM 并等待 daemon 退出 |
+| `logs <name\|batch_id>` | `logs()` | cat / tail -f daemon.log |
+| `list-batches` | `list_batches()` | 列出所有批次（读 summary.json，显示 daemon status） |
 | `init` | `init()` | 创建默认配置 |
-| `list-batches` | `list_batches()` | 列出保存的批次 |
 
 ### submit 命令流程
 
-1. `load_config()` → 加载配置
-2. `scan_directory()` → 扫描任务（填充 queue/nodes）
-3. `validate_and_assign_queues()` → 队列验证与分配（除非 `--no-queue-validation`）
-   - 不合规任务：显示警告 → `click.confirm()` → 用户选跳过则标记 SKIPPED
-4. `generate_batch_id()` + `load_state()` → 加载/创建状态
-5. `reconcile_tasks()` → 合并新旧状态（恢复场景）
-6. 如果 `--dry-run` → `run_dry_run()` 后返回
-7. 创建 `PBSClient` + `Display` + `Scheduler`
-8. `scheduler.run()` → 进入主循环
-9. `_print_summary()` → 输出最终摘要
+1. 解析 ROOT_DIRS + `--from-list` → 去重合并
+2. 多 root 时强制 `--name`；validate_identifier
+3. `load_config()` + `get_server()`
+4. `scan_directory()` × N → 合并 tasks
+5. `validate_and_assign_queues()` → 队列验证与分配
+6. `generate_batch_id(roots, name)` + `load_state()` → reconcile 或新建
+7. `BatchState.tasks = {t.directory: t}` + `rebuild_indexes()`
+8. `save_state()` 初始 bootstrap（documented bypass #1）
+9. `--dry-run` → `run_dry_run()` 返回
+10. `--foreground` → `_run_main()`（acquire_lock + scheduler.run 同进程）
+11. 默认 → `is_daemon_alive?` 拒绝 → `daemonize()` → `_run_daemon_main()` 在 grandchild
+
+### `_run_daemon_main` (grandchild entry)
+
+1. `_verify_lockf_works(batch_dir)`
+2. `acquire_lock(batch_id)` (`fcntl.lockf LOCK_EX|LOCK_NB`)
+3. `write_pid_file(batch_id)` (O_EXCL + btime)
+4. `load_state(batch_id)` — daemon 持锁后重读确保权威
+5. `cleanup_stale_artifacts(batch_id, state)`
+6. `PBSClient(server_config, batch_id=batch_id)` → `recover_sentinels(state, pbs)` (bypass #2)
+7. `BatchStore(state)` + `Scheduler(state, config, server, pbs, store)`
+8. `scheduler.run()`
+9. `finally`: close(lock_fd), unlink PID file
+
+### `run_dry_run(state, server_config)` (moved from scheduler.py)
+
+迁入 `cli.py`。纯读 Rich Table 预览，不实例化 BatchStore、不调用 save_state、不调用 PBS（bypass #3 是零调用的 bypass）。
 
 ### 延迟导入
 
-所有重量级模块在命令函数内部导入，避免 `--help` 时加载不必要的模块。
+所有重量级模块在命令函数内部 `from ... import ...`，避免 `--help` 时加载 scheduler/daemon/batch_store。

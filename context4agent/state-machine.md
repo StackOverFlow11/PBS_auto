@@ -105,3 +105,45 @@ scan_directory()                │  ┌────────────┐ 
 1. 如果 `task.status == SUBMITTED` 且作业消失 → WARNING（从未见到运行态）
 2. 如果有 `start_time` 且 `now - start_time < threshold` → WARNING
 3. 否则 → COMPLETED
+
+## Crash Recovery Windows (`_submit_task`)
+
+`_MutationContext` 配合 content-authoritative 哨兵文件覆盖 qsub 全生命周期的崩溃恢复。下表枚举 5 个崩溃点及其恢复行为：
+
+| # | 崩溃位置 | 磁盘 state | sentinel 内容 | PBS 作业? | 恢复 |
+|---|---|---|---|---|---|
+| 1 | `create_sentinel` 前 | PENDING | - | no | 重跑 |
+| 2 | sentinel 创建后 / qsub 前 | PENDING | `PENDING` | no | recover 读到 PENDING → unlink → 保持 PENDING → 下轮重新提交 |
+| 3 | qsub 后 / `update_sentinel_job_id` 前 | PENDING | `PENDING` | **yes** | **可接受的极小窗口**（warm FS 亚毫秒，NFS 10–100 ms）：unlink → 下轮重 qsub → duplicate job。由 `recover_sentinels` 步骤 5 的 **orphan PBS job WARN 扫描**捕获（job name `pa_<batch_id[:6]>` 未被引用 → 用户手动 qdel） |
+| 3' | `update_sentinel_job_id` 后 / save_state 前 | PENDING（陈旧） | `<real_job_id>` | yes | **3 → 3' 原子过渡**：`update_sentinel_job_id` 关闭窗口 3。recover 读 job_id → `pbs_jobs.get(id)` → state in {Q,R,H,W} → attach SUBMITTED |
+| 4 | save_state 后 / `remove_sentinel` 前 | SUBMITTED + job_id | `<real_job_id>` | yes | recover 看到 task.status ≠ PENDING → 直接 unlink sentinel |
+| 5 | `remove_sentinel` 后 / `invalidate_cache` 前 | SUBMITTED + job_id | - | yes | 下轮 poll 陈旧缓存 ≤5s，无害 |
+
+### 反伪造机制
+
+`recover_sentinels` 对每个 sentinel 做 filename-vs-content hash 交叉校验：`sha256(content_directory)[:24] == filename`。不匹配即拒绝并 unlink，防止伪造 sentinel 注入 job_id。
+
+### 并发 submit race
+
+`fcntl.lockf(<batch>/daemon.lock, LOCK_EX | LOCK_NB)` 是唯一权威互斥门：
+- A grandchild：`_verify_lockf_works` → `acquire_lock` 成功 → PID (O_EXCL) → recover + 主循环
+- B grandchild：`_verify_lockf_works` → `acquire_lock` 失败 → log + exit 1
+- A SIGKILL → kernel 自动释放 lockf → 下次 submit 可进
+- `recover_sentinels` 必须在 grandchild 持锁后执行（防止多实例同时恢复）
+
+### NFS 要求
+
+`fcntl.lockf` 依赖 NFSv3 的 `rpc.lockd` / `nfslock` 服务（CentOS 7 默认启用）。`_verify_lockf_works` 在 daemon 启动时做 O_EXCL 创建 → lockf → 释放的自检，失败明确报错退出。
+
+### Shutdown contract
+
+```
+SIGTERM → flag-only handler 设 _shutdown = True → return
+主循环完成当前 iter（_submit_pending 的 inner shutdown check 立即 yield）
+finally:
+  try: store.force_flush()                    # 最终快照 eager
+  try: os.close(lock_fd)                      # kernel 自动释放 lockf
+  try: get_pid_path(batch_id).unlink()
+```
+
+每一步 try/except log-and-continue，任一失败不阻断下一步。`_MutationContext.__exit__` 绝不抛异常，所有 FS 操作各自 try/except。`stop_daemon` timeout 默认 60s。

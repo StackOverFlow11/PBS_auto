@@ -15,11 +15,25 @@ from pbs_auto.models import PBSJobInfo, Task
 class PBSClient:
     """Interface for PBS commands (qsub, qstat, q)."""
 
-    def __init__(self, server_config: ServerConfig):
+    def __init__(
+        self, server_config: ServerConfig, batch_id: str | None = None
+    ):
         self.config = server_config
+        self.batch_id = batch_id
         self._cache: dict[str, PBSJobInfo] | None = None
         self._cache_time: float = 0
         self._cache_ttl: float = 5.0  # seconds
+
+    def _job_name(self, task: Task) -> str:
+        """Return the qsub -N value for a task.
+
+        Prefixed with `pa_<batch_id[:6]>` (informational only — recovery
+        matches by job_id from sentinel content, not by this name) so
+        orphan PBS job scans can identify batches reliably.
+        """
+        if self.batch_id:
+            return f"pa_{self.batch_id[:6]}"
+        return task.name
 
     def submit(self, task: Task) -> str:
         """Submit a job via qsub. Returns job_id on success, raises on failure."""
@@ -30,7 +44,7 @@ class PBSClient:
         cmd = ["qsub"]
         if task.queue:
             cmd.extend(["-q", task.queue])
-        cmd.extend(["-N", task.name, task.script_name])
+        cmd.extend(["-N", self._job_name(task), task.script_name])
 
         result = subprocess.run(
             cmd,

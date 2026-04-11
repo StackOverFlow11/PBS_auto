@@ -53,10 +53,12 @@ def sample_tasks():
 def sample_batch(sample_tasks):
     state = BatchState(
         batch_id="test123",
-        root_directory="/tmp/tasks",
+        root_directories=["/tmp/tasks"],
+        name="sample",
         server_profile="test",
     )
-    state.tasks = {t.name: t for t in sample_tasks}
+    state.tasks = {t.directory: t for t in sample_tasks}
+    state.rebuild_indexes()
     return state
 
 

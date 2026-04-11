@@ -50,7 +50,7 @@ name = "Group Server"
 status_command = "qstat"
 status_args = ["-au", "$USER"]
 max_running_cores = 240
-max_queued_cores = 96
+max_queued_cores = 400
 core_granularity = 24
 
 [servers.server2.queues.medium]
